@@ -37,6 +37,9 @@ class SparseCoderConfig(Serializable):
     num_latents: int = 0
     """Number of latents to use. If 0, use `expansion_factor`."""
 
+    d_out: int = 0
+    """Output dimension for transcoder. If 0, use same as d_in (for autoencoders)."""
+
     k: int = 32
     """Number of nonzero features."""
 

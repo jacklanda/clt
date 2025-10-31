@@ -21,7 +21,7 @@ from .utils import decoder_impl, load_sharded, save_sharded
 
 @dataclass
 class ForwardOutput:
-    sae_out: Tensor
+    y_hat: Tensor
 
     latent_acts: Tensor
     """Activations of the top-k latents."""
@@ -32,8 +32,38 @@ class ForwardOutput:
     fvu: Tensor
     """Fraction of variance unexplained."""
 
+    fve: Tensor
+    """Fraction of variance explained."""
+
     is_last: bool = False
     """Whether this is the last target in a multi-target setup."""
+
+    per_token_l0: float = 0.0
+    """L0 sparsity (number of latents used) per token."""
+
+    per_sequence_l0: float = 0.0
+    """L0 sparsity (number of latents used) per sequence."""
+
+    per_batch_l0: float = 0.0
+    """L0 sparsity (number of latents used) per batch."""
+
+    per_feature_l0: float = 0.0
+    """L0 sparsity (number of latents used) per feature."""
+
+    mse_loss: float = 0.0
+    """MSE loss."""
+
+    frac_dead: float = 0.0
+    """Fraction of dead latents."""
+
+    cossim: float = 0.0
+    """Cosine similarity between target and reconstruction."""
+
+    l2_ratio: float = 0.0
+    """L2 ratio between reconstruction and target."""
+
+    relative_reconstruction_bias: float = 0.0
+    """Relative reconstruction bias."""
 
 
 class MidDecoder:
@@ -177,35 +207,36 @@ class MidDecoder:
 
         # Decode
         if latent_acts is None and self.latent_indices is None:
-            sae_out = torch.zeros_like(self.x)
+            y_hat = torch.zeros_like(self.x)
         else:
             latent_indices = self.latent_indices
-            sae_out = self.sparse_coder.decode(latent_acts, latent_indices, index)
+            y_hat = self.sparse_coder.decode(latent_acts, latent_indices, index)
         W_skip = (
             self.sparse_coder.W_skips[index]
             if hasattr(self.sparse_coder, "W_skips")
             else self.sparse_coder.W_skip
         )
         if W_skip is not None:
-            sae_out += self.x.to(self.sparse_coder.dtype) @ W_skip.mT
-        sae_out += addition
+            y_hat += self.x.to(self.sparse_coder.dtype) @ W_skip.mT
+        y_hat += addition
 
         if denormalize:
-            sae_out = self.sparse_coder.denormalize_output(sae_out)
+            y_hat = self.sparse_coder.denormalize_output(y_hat)
 
         if no_extras:
+            raise NotImplementedError
             return ForwardOutput(
-                sae_out,
+                y_hat,
                 self.latent_acts,
                 self.latent_indices,
-                sae_out.new_tensor(0.0),
-                sae_out.new_tensor(0.0),
-                sae_out.new_tensor(0.0),
+                y_hat.new_tensor(0.0),
+                y_hat.new_tensor(0.0),
+                y_hat.new_tensor(0.0),
                 is_last,
             )
         else:
             # Compute the residual
-            e = y - sae_out
+            e = y - y_hat
             if loss_mask is not None:
                 e = e * loss_mask[..., None]
 
@@ -217,16 +248,88 @@ class MidDecoder:
                 y_mean = (y * lm).sum(0) / lm.sum(0)
                 total_variance = (y - y_mean).pow(2).mul(lm).sum()
 
-            l2_loss = e.pow(2).sum()
-            fvu = l2_loss / total_variance
+            # SSE (Sum of Squared Errors)
+            sse = e.pow(2).sum()
 
-        return ForwardOutput(
-            sae_out,
-            self.latent_acts,
-            self.latent_indices,
-            fvu,
-            is_last,
-        )
+            # MSE (L2) loss
+            mse_loss = e.pow(2).mean()
+
+            # fraction of variance unexplained (FVU)
+            fvu = sse / total_variance
+
+            # fraction of variance explained (FVE)
+            fve = 1.0 - fvu
+
+            # L2 ratio
+            l2_ratio = (
+                torch.linalg.norm(y_hat, dim=-1) / torch.linalg.norm(y, dim=-1)
+            ).mean()
+
+            # Relative reconstruction bias
+            y_hat_norm_squared = torch.linalg.norm(y_hat, dim=-1, ord=2).pow(2)
+            y_dot_y_hat = (y * y_hat).sum(dim=-1)
+            relative_reconstruction_bias = (
+                y_hat_norm_squared.mean() / y_dot_y_hat.mean()
+            )
+
+            # Cosine similarity between target and reconstruction
+            y_normed = y / torch.linalg.norm(y, dim=-1, keepdim=True)
+            y_hat_normed = y_hat / torch.linalg.norm(y_hat, dim=-1, keepdim=True)
+            cossim = (y_normed * y_hat_normed).sum(dim=-1).mean()
+
+            context_stripe = 128
+            # L0 sparsity: fraction of latents used
+            per_token_l0 = (
+                (latent_acts != 0).float().sum(dim=-1).mean()
+            )  # Shape: Scalar
+            # print("per_token_l0:", per_token_l0.item())
+
+            # per "ctx_len" as a sequence in the batch
+            latent_acts_reshaped = latent_acts.view(
+                latent_acts.shape[0] // context_stripe,
+                context_stripe,
+                latent_acts.shape[1],
+            )
+            per_sequence_l0 = (
+                (latent_acts_reshaped != 0).float().sum(dim=(1, 2)).mean()
+            )  # Shape: Scalar
+
+            per_batch_l0 = (latent_acts != 0).float().sum()  # batch l0, Scalar
+            per_feature_l0 = (
+                (latent_acts != 0).float().sum(dim=0)
+            )  # Shape: (num_latents,)
+
+            # fraction of dead latents
+            if self.dead_mask is not None:
+                num_dead = self.dead_mask.sum().item()
+                total_latents = self.dead_mask.numel()
+                frac_dead = num_dead / total_latents
+            else:
+                frac_dead = torch.tensor(0.0)
+
+            # TODO: add transcoding cross-entropy losses of language models
+            # - "loss_original"
+            # - "loss_transcoded"
+            # - "loss_zero"
+            # - "frac_recovered"
+
+            return ForwardOutput(
+                y_hat=y_hat,
+                latent_acts=self.latent_acts,
+                latent_indices=self.latent_indices,
+                fvu=fvu,
+                fve=fve,
+                is_last=is_last,
+                per_token_l0=per_token_l0,
+                per_sequence_l0=per_sequence_l0,
+                per_batch_l0=per_batch_l0,
+                per_feature_l0=per_feature_l0,
+                mse_loss=mse_loss,
+                frac_dead=frac_dead,
+                cossim=cossim,
+                l2_ratio=l2_ratio,
+                relative_reconstruction_bias=relative_reconstruction_bias,
+            )
 
 
 class SparseCoder(nn.Module):
@@ -239,10 +342,15 @@ class SparseCoder(nn.Module):
         *,
         decoder: bool = True,
         mesh: Optional[DeviceMesh] = None,
+        d_out: int | None = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.d_in = d_in
+        # Support separate output dimension for transcoders with dimension change
+        self.d_out = (
+            d_out if d_out is not None else (cfg.d_out if cfg.d_out > 0 else d_in)
+        )
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
         self.multi_target = cfg.n_targets > 0 and cfg.transcode
         self.mesh = mesh
@@ -307,7 +415,7 @@ class SparseCoder(nn.Module):
                         num_latents *= max(1, cfg.n_sources)
                     if mesh is not None:
                         result = dtensor.zeros(
-                            (num_latents, d_in),
+                            (num_latents, self.d_out),
                             dtype=decoder_dtype,
                             device_mesh=mesh,
                             placements=[
@@ -317,7 +425,7 @@ class SparseCoder(nn.Module):
                         )
                     else:
                         result = torch.zeros(
-                            num_latents, d_in, device=device, dtype=decoder_dtype
+                            num_latents, self.d_out, device=device, dtype=decoder_dtype
                         )
                     return nn.Parameter(result)
 
@@ -348,7 +456,7 @@ class SparseCoder(nn.Module):
         def create_bias():
             if mesh is not None:
                 result = dtensor.zeros(
-                    (self.d_in,),
+                    (self.d_out,),
                     dtype=dtype,
                     device_mesh=mesh,
                     placements=[
@@ -357,7 +465,7 @@ class SparseCoder(nn.Module):
                     ],
                 )
             else:
-                result = torch.zeros(self.d_in, device=device, dtype=dtype)
+                result = torch.zeros(self.d_out, device=device, dtype=dtype)
             return nn.Parameter(result)
 
         def create_W_skip():
@@ -365,13 +473,13 @@ class SparseCoder(nn.Module):
                 return None
             if mesh is not None:
                 result = dtensor.zeros(
-                    (self.d_in, self.d_in),
+                    (self.d_out, self.d_in),
                     dtype=dtype,
                     device_mesh=mesh,
                     placements=[dtensor.Replicate(), dtensor.Shard(0)],
                 )
             else:
-                result = torch.zeros(self.d_in, self.d_in, device=device, dtype=dtype)
+                result = torch.zeros(self.d_out, self.d_in, device=device, dtype=dtype)
             return nn.Parameter(result)
 
         if self.multi_target and self.cfg.coalesce_topk not in ("concat", "per-layer"):
@@ -515,9 +623,14 @@ class SparseCoder(nn.Module):
         with open(path / "cfg.json", "r") as f:
             cfg_dict = json.load(f)
             d_in = cfg_dict.pop("d_in")
+            d_out = cfg_dict.pop(
+                "d_out", None
+            )  # Support legacy checkpoints without d_out
             cfg = SparseCoderConfig.from_dict(cfg_dict, drop_extra_fields=True)
 
-        sae = SparseCoder(d_in, cfg, device=device, decoder=decoder, mesh=mesh)
+        sae = SparseCoder(
+            d_in, cfg, device=device, decoder=decoder, mesh=mesh, d_out=d_out
+        )
         sae.load_state(path)
         return sae
 
@@ -607,6 +720,7 @@ class SparseCoder(nn.Module):
                     {
                         **self.cfg.to_dict(),
                         "d_in": self.d_in,
+                        "d_out": self.d_out,
                     },
                     f,
                 )

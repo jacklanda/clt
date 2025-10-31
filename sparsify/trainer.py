@@ -99,8 +99,23 @@ class Trainer:
         device = model.device
         with self.implicit_replication():
             input_widths = resolve_widths(
-                model, cfg.hookpoints, mesh=self.mesh if DISTRIBUTE_MODEL else None
+                model,
+                cfg.hookpoints,
+                mesh=self.mesh if DISTRIBUTE_MODEL else None,
+                use_input_dim=cfg.sae.transcode,
             )
+            # For transcoders, also resolve output dimensions
+            if cfg.sae.transcode:
+                output_widths = resolve_widths(
+                    model,
+                    cfg.hookpoints,
+                    mesh=self.mesh if DISTRIBUTE_MODEL else None,
+                    use_input_dim=False,
+                )
+            else:
+                output_widths = (
+                    input_widths  # For autoencoders, input and output are the same
+                )
         unique_widths = set(input_widths.values())
 
         if cfg.distribute_modules and len(unique_widths) > 1:
@@ -143,6 +158,7 @@ class Trainer:
                     device,
                     mesh=mesh,
                     dtype=torch.float32,
+                    d_out=output_widths[hook],
                 )
 
         assert isinstance(dataset, Sized)
@@ -403,7 +419,7 @@ class Trainer:
             p.numel() for s in self.saes.values() for p in s.parameters()
         )
         num_model_params = sum(p.numel() for p in self.model.parameters())
-        print(f"Number of SAE parameters: {num_sae_params:_}")
+        print(f"Number of CLT parameters: {num_sae_params:_}")
         print(f"Number of model parameters: {num_model_params:_}")
 
         num_batches = len(self.dataset) // self.cfg.batch_size
@@ -444,6 +460,14 @@ class Trainer:
 
         # For logging purposes
         avg_fvu = defaultdict(float)
+        avg_fve = defaultdict(float)
+        avg_per_token_l0 = defaultdict(float)
+        avg_per_sequence_l0 = defaultdict(float)
+        avg_per_batch_l0 = defaultdict(float)
+        avg_per_feature_l0 = defaultdict(float)
+        avg_mse_loss = defaultdict(float)
+        avg_frac_dead = defaultdict(float)
+        avg_l2_ratio = defaultdict(float)
         fvu_losses = defaultdict(float)
         avg_ce = 0.0
         avg_kl = 0.0
@@ -519,21 +543,62 @@ class Trainer:
 
             outputs_original = outputs
 
-            # Flatten the batch and sequence dimensions
-            outputs = outputs.flatten(0, 1)
-            inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
+            # Flatten the batch and sequence dimensions (only if they are still separate)
+            # Only flatten if tensors have 3 or more dimensions (batch, seq, hidden_dim)
+            if outputs.ndim >= 3:
+                outputs = outputs.flatten(0, 1)
+            if self.cfg.sae.transcode:
+                if inputs.ndim >= 3:
+                    inputs = inputs.flatten(0, 1)
+            else:
+                inputs = outputs
 
             if self.mesh is not None:
-                if not DISTRIBUTE_MODEL:
-                    inputs = DTensor.from_local(inputs, self.mesh, [Shard(0), Shard(0)])
+                # If tensors are already DTensors from distributed model, convert to local first
+                if isinstance(inputs, DTensor):
+                    # Fully replicate and then convert to local
+                    inputs = inputs.redistribute(
+                        self.mesh, [Replicate(), Replicate()]
+                    ).to_local()
+                    # Re-create as DTensor with correct placements
+                    inputs = DTensor.from_local(
+                        inputs, self.mesh, [Replicate(), Replicate()]
+                    )
+                if isinstance(outputs, DTensor):
+                    # Fully replicate and then convert to local
+                    outputs = outputs.redistribute(
+                        self.mesh, [Replicate(), Replicate()]
+                    ).to_local()
+                    # Re-create as DTensor with correct placements
                     outputs = DTensor.from_local(
-                        outputs, self.mesh, [Shard(0), Shard(0)]
+                        outputs, self.mesh, [Replicate(), Replicate()]
                     )
+
+                if not DISTRIBUTE_MODEL:
+                    # Convert local tensors to replicated DTensors
+                    if not isinstance(inputs, DTensor):
+                        inputs = DTensor.from_local(
+                            inputs, self.mesh, [Replicate(), Replicate()]
+                        )
+                    if not isinstance(outputs, DTensor):
+                        outputs = DTensor.from_local(
+                            outputs, self.mesh, [Replicate(), Replicate()]
+                        )
                     bos_mask_mesh = DTensor.from_local(
-                        bos_mask.flatten(0, 1), self.mesh, [Shard(0), Shard(0)]
+                        bos_mask.flatten(0, 1), self.mesh, [Replicate(), Replicate()]
                     )
+                else:
+                    bos_mask_mesh = DTensor.from_local(
+                        bos_mask.flatten(0, 1), self.mesh, [Replicate(), Replicate()]
+                    )
+
                 inputs = inputs.redistribute(self.mesh, [Shard(0), Replicate()])
-                outputs = outputs.redistribute(self.mesh, [Shard(0), Shard(1)])
+                # Check if outputs has enough dimensions for Shard(1)
+                if outputs.ndim >= 2:
+                    outputs = outputs.redistribute(self.mesh, [Shard(0), Shard(1)])
+                else:
+                    # For 1D tensors, replicate along the second mesh dimension
+                    outputs = outputs.redistribute(self.mesh, [Shard(0), Replicate()])
                 bos_mask_mesh = bos_mask_mesh.redistribute(
                     self.mesh, [Shard(0), Replicate()]
                 )
@@ -551,31 +616,130 @@ class Trainer:
                 if self.cfg.sae.transcode:
                     if self.mesh is not None and self.mesh.shape[0] == 1:
                         # fix annoying SIGSEGV
-                        mean = inputs.to_local().mean(0).to(raw.dtype)
-                        mean = DTensor.from_local(
-                            mean, self.mesh, [Replicate(), Replicate()]
-                        )
+                        # Need to fully replicate inputs before computing mean to ensure correct shape
+                        if isinstance(inputs, DTensor):
+                            inputs_replicated = inputs.redistribute(
+                                self.mesh, [Replicate(), Replicate()]
+                            )
+                            inputs_local = inputs_replicated.to_local()
+                            mean_local = inputs_local.mean(0).to(raw.dtype)
+                        else:
+                            mean_local = inputs.mean(0).to(raw.dtype)
+                        # Ensure mean is at least 1D for linear operation
+                        if mean_local.ndim == 0:
+                            mean_local = mean_local.unsqueeze(0)
+                        mean = mean_local  # Keep as local tensor
                     else:
-                        mean = inputs.mean(0).to(raw.dtype)
-                    mean, weight, bias = (
-                        -mean,
-                        wrapped.encoder.weight.data,
-                        wrapped.encoder.bias.data * 0,
-                    )
+                        # Ensure inputs is fully replicated before computing mean to get correct global mean
+                        if isinstance(inputs, DTensor):
+                            # Debug: print shapes
+                            import torch.distributed as dist
+
+                            if dist.get_rank() == 0:
+                                print(
+                                    f"Debug: inputs shape before redistribute: {inputs.shape}, placements: {inputs.placements}"
+                                )
+                            inputs_replicated = inputs.redistribute(
+                                self.mesh, [Replicate(), Replicate()]
+                            )
+                            if dist.get_rank() == 0:
+                                print(
+                                    f"Debug: inputs_replicated shape: {inputs_replicated.shape}, placements: {inputs_replicated.placements}"
+                                )
+                            inputs_local = inputs_replicated.to_local()
+                            if dist.get_rank() == 0:
+                                print(
+                                    f"Debug: inputs_local shape: {inputs_local.shape}"
+                                )
+                            mean = inputs_local.mean(0).to(raw.dtype)
+                            if dist.get_rank() == 0:
+                                print(f"Debug: mean shape after mean(0): {mean.shape}")
+                        else:
+                            mean = inputs.mean(0).to(raw.dtype)
+
+                    # Ensure all tensors are local before linear operation
+                    mean = -mean
+                    weight = wrapped.encoder.weight.data
+                    bias = wrapped.encoder.bias.data * 0
+
+                    # Convert DTensors to local if needed, fully replicating first
+                    if isinstance(weight, DTensor):
+                        weight = weight.redistribute(
+                            self.mesh, [Replicate(), Replicate()]
+                        ).to_local()
+                    if isinstance(bias, DTensor):
+                        # For 1D bias tensor on 2D mesh, need 2 placements
+                        if self.mesh.ndim == 2:
+                            bias = bias.redistribute(
+                                self.mesh, [Replicate(), Replicate()]
+                            ).to_local()
+                        else:
+                            bias = bias.redistribute(
+                                self.mesh, [Replicate()]
+                            ).to_local()
+
                     mean_image = torch.nn.functional.linear(mean, weight, bias)
+                    # Convert mean_image to DTensor if encoder.bias is a DTensor
+                    if isinstance(raw.encoder.bias.data, DTensor):
+                        # mean_image is computed with full replicated weights, so it has full size
+                        # Create as replicated DTensor first, then redistribute to match encoder.bias placement
+                        mean_image = DTensor.from_local(
+                            mean_image, self.mesh, [Replicate(), Replicate()]
+                        ).redistribute(self.mesh, raw.encoder.bias.data.placements)
                     raw.encoder.bias.data[:] = mean_image
 
                 if self.mesh is not None and self.mesh.shape[0] == 1:
-                    mean = outputs.to_local().mean(0).to(raw.dtype)
-                    mean = DTensor.from_local(mean, self.mesh, [Replicate(), Shard(0)])
+                    # Need to fully replicate outputs before computing mean to ensure correct shape
+                    if isinstance(outputs, DTensor):
+                        outputs_replicated = outputs.redistribute(
+                            self.mesh, [Replicate(), Replicate()]
+                        )
+                        mean_local = outputs_replicated.to_local().mean(0).to(raw.dtype)
+                    else:
+                        mean_local = outputs.mean(0).to(raw.dtype)
+                    # Ensure mean is at least 1D
+                    if mean_local.ndim == 0:
+                        mean_local = mean_local.unsqueeze(0)
+                    # mean_local is the full mean computed from replicated outputs
+                    # Create as replicated DTensor, then redistribute to match decoder bias placement if needed
+                    if isinstance(outputs, DTensor):
+                        mean = DTensor.from_local(
+                            mean_local, self.mesh, [Replicate(), Replicate()]
+                        )
+                    else:
+                        mean = mean_local
                 else:
-                    mean = outputs.mean(0)
+                    # Ensure outputs is fully replicated before computing mean to get correct global mean
+                    if isinstance(outputs, DTensor):
+                        outputs_replicated = outputs.redistribute(
+                            self.mesh, [Replicate(), Replicate()]
+                        )
+                        mean = outputs_replicated.to_local().mean(0)
+                    else:
+                        mean = outputs.mean(0)
                 if not hasattr(raw, "b_decs"):
-                    raw.b_dec.data[:] = mean.to(raw.dtype)
+                    # Ensure mean is DTensor if b_dec is DTensor
+                    if isinstance(raw.b_dec.data, DTensor) and not isinstance(
+                        mean, DTensor
+                    ):
+                        mean = DTensor.from_local(
+                            mean.to(raw.dtype), self.mesh, [Replicate(), Replicate()]
+                        ).redistribute(self.mesh, raw.b_dec.data.placements)
+                    else:
+                        mean = mean.to(raw.dtype)
+                    raw.b_dec.data[:] = mean
                 else:
                     # the current layer must be what handles the bias,
                     # not the contributing previous layers
-                    raw.b_decs[0].data[:] = mean.to(raw.dtype)
+                    if isinstance(raw.b_decs[0].data, DTensor) and not isinstance(
+                        mean, DTensor
+                    ):
+                        mean = DTensor.from_local(
+                            mean.to(raw.dtype), self.mesh, [Replicate(), Replicate()]
+                        ).redistribute(self.mesh, raw.b_decs[0].data.placements)
+                    else:
+                        mean = mean.to(raw.dtype)
+                    raw.b_decs[0].data[:] = mean
 
                 if raw.cfg.normalize_io:
                     in_norm = inputs.norm(dim=-1).mean()
@@ -608,7 +772,7 @@ class Trainer:
                 detach_grad=loss_fn == "fvu",
                 loss_mask=(~bos_mask_mesh if loss_fn == "fvu" else None),
             )
-            output = out.sae_out
+            output = out.y_hat
 
             if self.cfg.loss_fn == "fvu":
                 del output
@@ -617,7 +781,7 @@ class Trainer:
             assert isinstance(out, ForwardOutput)
 
             if self.cfg.loss_fn == "kl-fvu":
-                fvu_losses[name] = float(out.fvu.detach())
+                fvu_losses[name] = float(out.fvu.detach().mean())
 
             # Update the did_fire mask
             latent_indices = encoding.latent_indices.flatten()
@@ -645,7 +809,15 @@ class Trainer:
                 # Replace the normal output with the SAE output
                 return (output, *aux_out) if aux_out is not None else output
             else:
-                avg_fvu[name] += float(out.fvu.detach() / denom)
+                avg_fvu[name] += float(out.fvu.detach().mean() / denom)
+                avg_fve[name] += float(out.fve.detach().mean() / denom)
+                avg_per_token_l0[name] += float(out.per_token_l0 / denom)
+                avg_per_sequence_l0[name] += float(out.per_sequence_l0 / denom)
+                avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / denom)
+                avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / denom)
+                avg_mse_loss[name] += float(out.mse_loss / denom)
+                avg_frac_dead[name] += float(out.frac_dead / denom)
+                avg_l2_ratio[name] += float(out.l2_ratio / denom)
 
                 prev_modules = [mod for mod in runner.outputs.keys() if mod != name]
                 prev_modules = [self.saes[mod] for mod in prev_modules]
@@ -672,7 +844,7 @@ class Trainer:
                     dead_latent_loss = dead_latent_loss + active_correction
 
                 loss = (
-                    out.fvu + self.cfg.dead_latent_penalty * dead_latent_loss
+                    out.fvu.mean() + self.cfg.dead_latent_penalty * dead_latent_loss
                 ) / acc_steps
 
                 # Do a "local" backward pass if we're not training end-to-end
@@ -683,9 +855,12 @@ class Trainer:
 
         for batch in dl:
             x = self.input_ids_to_mesh(batch["input_ids"])
-            bos_mask = x == self.model.config.bos_token_id
+            if self.model.config.bos_token_id is not None:
+                bos_mask = x == self.model.config.bos_token_id
+            else:
+                bos_mask = torch.zeros_like(x, dtype=torch.bool)
             if not self.cfg.filter_bos:
-                bos_mask &= 0
+                bos_mask[:] = False
             if self.cfg.remove_first_token:
                 bos_mask[:, 0] = True
 
@@ -843,6 +1018,16 @@ class Trainer:
                         info.update({f"dead_pct/{name}": ratio})
                         if "fvu" in self.cfg.loss_fn:
                             info[f"fvu/{name}"] = avg_fvu[name]
+                            info[f"fve/{name}"] = avg_fve[name]
+
+                        info[f"mse(l2)/{name}"] = avg_mse_loss[name]
+                        info[f"frac_dead/{name}"] = avg_frac_dead[name]
+
+                        info[f"l0(per_token)/{name}"] = avg_per_token_l0[name]
+                        info[f"l0(per_sequence)/{name}"] = avg_per_sequence_l0[name]
+                        info[f"l0(per_batch)/{name}"] = avg_per_batch_l0[name]
+                        info[f"l0(per_feature)/{name}"] = avg_per_feature_l0[name]
+                        info[f"l2_ratio/{name}"] = avg_l2_ratio[name]
 
                     if rank_zero:
                         info["k"] = self.get_current_k()
@@ -851,6 +1036,14 @@ class Trainer:
                             wandb.log(info, step=step)
 
                 avg_fvu.clear()
+                avg_fve.clear()
+                avg_per_token_l0.clear()
+                avg_per_sequence_l0.clear()
+                avg_per_batch_l0.clear()
+                avg_per_feature_l0.clear()
+                avg_mse_loss.clear()
+                avg_l2_ratio.clear()
+                avg_frac_dead.clear()
                 avg_ce = 0.0
                 avg_kl = 0.0
                 avg_acc_top1 = 0.0

@@ -1,4 +1,5 @@
 import os
+import warnings
 from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
 from datetime import timedelta
@@ -23,18 +24,28 @@ from .data import MemmapDataset, chunk_and_tokenize
 from .trainer import TrainConfig, Trainer
 from .utils import DISTRIBUTE_MODEL
 
+# Suppress Pydantic warnings from simple_parsing's internal implementation
+warnings.filterwarnings(
+    "ignore",
+    message=".*'repr' attribute.*has no effect in the context it was used.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*'frozen' attribute.*has no effect in the context it was used.*",
+)
+
 
 @dataclass
 class RunConfig(TrainConfig):
     model: str = field(
         default="HuggingFaceTB/SmolLM2-135M",
-        positional=True,
+        positional=False,
     )
     """Name of the model to train."""
 
     dataset: str = field(
-        default="EleutherAI/SmolLM2-135M-10B",
-        positional=True,
+        default="/share/nlp/liuyang/workspace/RouterScope/data/openwebtext",
+        positional=False,
     )
     """Path to the dataset to use for training."""
 
@@ -71,7 +82,7 @@ class RunConfig(TrainConfig):
     """Random seed for shuffling the dataset."""
 
     data_preprocessing_num_proc: int = field(
-        default_factory=lambda: cpu_count() // 2,
+        default_factory=lambda: cpu_count(),
     )
     """Number of processes to use for preprocessing data"""
 
@@ -88,6 +99,7 @@ def load_artifacts(
 
     # End-to-end training requires a model with a causal LM head
     model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
+    # model_cls = AutoModelForCausalLM
     model = model_cls.from_pretrained(
         args.model,
         device_map={"": f"cuda:{rank}"},
@@ -97,9 +109,10 @@ def load_artifacts(
             else None
         ),
         revision=args.revision,
-        torch_dtype=dtype,
+        dtype=dtype,
         token=args.hf_token,
     )
+
     if torch.distributed.is_initialized() and DISTRIBUTE_MODEL:
         # TODO: sdpa doesn't shard correctly
         # model.config._attn_implementation = "eager"
@@ -116,7 +129,6 @@ def load_artifacts(
                 args.dataset,
                 split=args.split,
                 # TODO: Maybe set this to False by default? But RPJ requires it.
-                trust_remote_code=True,
             )
         except ValueError as e:
             # Automatically use load_from_disk if appropriate
@@ -141,7 +153,6 @@ def load_artifacts(
         else:
             print("Dataset already tokenized; skipping tokenization.")
 
-        print(f"Shuffling dataset with seed {args.shuffle_seed}")
         dataset = dataset.shuffle(args.shuffle_seed)
 
         dataset = dataset.with_format("torch")
@@ -176,9 +187,12 @@ def run():
             mesh_dim_names=("dp", "tp"),
         )
         dp_rank = mesh.get_coordinate()[0]  # type: ignore
+        dp_size = world_size // args.tp
 
         if rank == 0:
-            print(f"Using DDP/TP across {dist.get_world_size()} GPUs.")
+            print(
+                f"Using DP({dp_size}) * TP({args.tp}) across {dist.get_world_size()} GPUs."
+            )
 
         dist.barrier()
     else:

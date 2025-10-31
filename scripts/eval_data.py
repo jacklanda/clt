@@ -1,8 +1,10 @@
 #%%
-model_type = "llama-1b"
+# model_type = "llama-1b"
+model_type = "llama3"
 # model_type = "gpt2"
 # model_type = "gemma-2-2b"
-%env CUDA_VISIBLE_DEVICES=2
+# %env CUDA_VISIBLE_DEVICES=2
+# CUDA_VISIBLE_DEVICES=0
 from sparsify.__main__ import load_artifacts, RunConfig
 
 
@@ -11,10 +13,11 @@ cfg = RunConfig(
         "gpt2": "gpt2",
         "gemma-2-2b": "google/gemma-2-2b",
         "llama-1b": "meta-llama/Llama-3.2-1B",
+        "llama3": "/share/nlp/share/plm/Llama-3.1-8B-Instruct",
     }[model_type],
-    dataset="EleutherAI/SmolLM2-135M-10B",
+    dataset="/share/nlp/liuyang/workspace/RouterScope/data/c4_tiny",
     split="train",
-    ctx_len=16,
+    ctx_len=128,
     return_overflowed_tokens=False,
     sae=None,
     loss_fn="kl",

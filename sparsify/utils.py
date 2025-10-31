@@ -112,23 +112,46 @@ def resolve_widths(
     module_names: list[str],
     dim: int = -1,
     mesh: Optional[DeviceMesh] = None,
+    use_input_dim: bool = False,
 ) -> dict[str, int]:
-    """Find number of output dimensions for the specified modules."""
+    """Find number of output dimensions for the specified modules.
+
+    Args:
+        model: The model to inspect
+        module_names: Names of modules to get dimensions for
+        dim: Which dimension to extract (default -1 for last dimension)
+        mesh: Optional device mesh for distributed tensors
+        use_input_dim: If True, use input dimensions instead of output dimensions (for transcoders)
+    """
     module_to_name = {
         model.base_model.get_submodule(name): name for name in module_names
     }
     shapes: dict[str, int] = {}
 
-    def hook(module, _, output):
+    def hook(module, inputs, output):
         # Unpack tuples if needed
-        if isinstance(output, tuple):
-            output, *_ = output
+        if use_input_dim:
+            # Use input dimensions for transcoders
+            if isinstance(inputs, tuple):
+                tensor = inputs[0]
+            else:
+                tensor = inputs
+        else:
+            # Use output dimensions for standard SAEs
+            if isinstance(output, tuple):
+                tensor, *_ = output
+            else:
+                tensor = output
 
         name = module_to_name[module]
-        shapes[name] = output.shape[dim]
+        shapes[name] = tensor.shape[dim]
 
     handles = [mod.register_forward_hook(hook) for mod in module_to_name]
     with torch.inference_mode() if mesh is None else torch.no_grad():
+        # Don't use distribute_tensor here because:
+        # 1. This is only inference to get shapes, not actual training
+        # 2. The caller already wraps this in implicit_replication() context
+        # 3. Some models (e.g., MoE) have operations incompatible with DTensor
         dummy = {
             k: v.to(model.device) if mesh is None else distribute_tensor(v, mesh)
             for k, v in model.dummy_inputs.items()
@@ -161,6 +184,7 @@ def set_submodule(model: nn.Module, submodule_path: str, new_submodule: nn.Modul
 
 def sharded_axis(
     state_dict: dict[str, DTensor],
+    verbose: bool = False,
 ) -> dict[str, Optional[int]]:
     """
     Checks which axis each DTensor is sharded on.
@@ -169,6 +193,7 @@ def sharded_axis(
 
     Args:
         state_dict (dict[str, DTensor]): The state dictionary containing DTensors.
+        verbose (bool): If True, print warnings for non-DTensor keys.
 
     Returns:
         dict[str, Optional[int]]: A dictionary mapping each key to the
@@ -179,7 +204,8 @@ def sharded_axis(
         try:
             sharding = tensor.placements
         except AttributeError:
-            print(f"Warning: key {key} is not a DTensor, skipping sharded axis check.")
+            if verbose:
+                print(f"Warning: key {key} is not a DTensor, skipping sharded axis check.")
             sharded_axes[key] = None
             continue
         assert isinstance(sharding[0], Replicate)

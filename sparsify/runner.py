@@ -5,7 +5,7 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental import local_map
 
-from .sparse_coder import MidDecoder, SparseCoder
+from .sparse_coder import MidDecoder, SparseCoder, ForwardOutput
 
 
 class CrossLayerRunner(object):
@@ -30,7 +30,7 @@ class CrossLayerRunner(object):
         detach_grad: bool = False,
         advance: bool = True,
         **kwargs,
-    ):
+    ) -> ForwardOutput:
         self.outputs[module_name] = mid_out
 
         candidate_indices = []
