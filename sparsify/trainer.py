@@ -157,7 +157,8 @@ class Trainer:
                     sae_cfg,
                     device,
                     mesh=mesh,
-                    dtype=torch.float32,
+                    # dtype=torch.float32,
+                    dtype=torch.float16,
                     d_out=output_widths[hook],
                 )
 
@@ -404,12 +405,25 @@ class Trainer:
             try:
                 import wandb
 
-                wandb.init(
-                    name=self.cfg.run_name,
-                    project="sparsify",
-                    config=asdict(self.cfg),
-                    save_code=True,
-                )
+                if self.cfg.resume and self.cfg.run_id is not None:
+                    print(f'Resuming Weights & Biases run with ID "{self.cfg.run_id}"')
+                    wandb.init(
+                        name=self.cfg.run_name,
+                        project=os.getenv("WANDB_PROJECT", "sparsify"),
+                        entity=os.getenv("WANDB_ENTITY", None),
+                        id=self.cfg.run_id,
+                        resume="allow",
+                        config=asdict(self.cfg),
+                        save_code=True,
+                    )
+                else:
+                    wandb.init(
+                        name=self.cfg.run_name,
+                        project=os.getenv("WANDB_PROJECT", "sparsify"),
+                        entity=os.getenv("WANDB_ENTITY", None),
+                        config=asdict(self.cfg),
+                        save_code=True,
+                    )
             except (AttributeError, ImportError):
                 print("Weights & Biases not available, skipping logging.")
                 print("Run `pip install -U wandb` if you want to use it.")
@@ -465,9 +479,17 @@ class Trainer:
         avg_per_sequence_l0 = defaultdict(float)
         avg_per_batch_l0 = defaultdict(float)
         avg_per_feature_l0 = defaultdict(float)
+        avg_per_token_l1 = defaultdict(float)
+        avg_per_sequence_l1 = defaultdict(float)
+        avg_per_batch_l1 = defaultdict(float)
+        avg_per_feature_l1 = defaultdict(float)
         avg_mse_loss = defaultdict(float)
+        avg_norm_mse_loss = defaultdict(float)
         avg_frac_dead = defaultdict(float)
         avg_l2_ratio = defaultdict(float)
+        avg_cossim = defaultdict(float)
+        avg_relative_reconstruction_bias = defaultdict(float)
+        seen_tokens = 0
         fvu_losses = defaultdict(float)
         avg_ce = 0.0
         avg_kl = 0.0
@@ -815,9 +837,18 @@ class Trainer:
                 avg_per_sequence_l0[name] += float(out.per_sequence_l0 / denom)
                 avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / denom)
                 avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / denom)
+                avg_per_token_l1[name] += float(out.per_token_l1 / denom)
+                avg_per_sequence_l1[name] += float(out.per_sequence_l1 / denom)
+                avg_per_batch_l1[name] += float(out.per_batch_l1.sum() / denom)
+                avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / denom)
                 avg_mse_loss[name] += float(out.mse_loss / denom)
+                avg_norm_mse_loss[name] += float(out.norm_mse_loss / denom)
                 avg_frac_dead[name] += float(out.frac_dead / denom)
                 avg_l2_ratio[name] += float(out.l2_ratio / denom)
+                avg_cossim[name] += float(out.cossim / denom)
+                avg_relative_reconstruction_bias[name] += float(
+                    out.relative_reconstruction_bias / denom
+                )
 
                 prev_modules = [mod for mod in runner.outputs.keys() if mod != name]
                 prev_modules = [self.saes[mod] for mod in prev_modules]
@@ -1021,16 +1052,39 @@ class Trainer:
                             info[f"fve/{name}"] = avg_fve[name]
 
                         info[f"mse(l2)/{name}"] = avg_mse_loss[name]
+                        info[f"norm_mse/{name}"] = avg_norm_mse_loss[name]
                         info[f"frac_dead/{name}"] = avg_frac_dead[name]
 
                         info[f"l0(per_token)/{name}"] = avg_per_token_l0[name]
                         info[f"l0(per_sequence)/{name}"] = avg_per_sequence_l0[name]
                         info[f"l0(per_batch)/{name}"] = avg_per_batch_l0[name]
                         info[f"l0(per_feature)/{name}"] = avg_per_feature_l0[name]
+                        info[f"l1(per_token)/{name}"] = avg_per_token_l1[name]
+                        info[f"l1(per_sequence)/{name}"] = avg_per_sequence_l1[name]
+                        info[f"l1(per_batch)/{name}"] = avg_per_batch_l1[name]
+                        info[f"l1(per_feature)/{name}"] = avg_per_feature_l1[name]
                         info[f"l2_ratio/{name}"] = avg_l2_ratio[name]
+                        info[f"cossim/{name}"] = avg_cossim[name]
+                        info[f"relative_reconstruction_bias/{name}"] = (
+                            avg_relative_reconstruction_bias[name]
+                        )
 
                     if rank_zero:
-                        info["k"] = self.get_current_k()
+                        info["train/k"] = self.get_current_k()
+                        info["train/lr"] = self.optimizers[0].param_groups[0]["lr"]
+                        info["train/global_step"] = step
+                        info["train/epoch"] = (step * self.cfg.batch_size) / len(
+                            self.dataset
+                        )
+                        info["train/seen_tokens"] = seen_tokens = (
+                            seen_tokens + self.cfg.batch_size * self.cfg.ctx_len
+                        )
+                        for name in self.cfg.hookpoints:
+                            info[f"loss/{name}"] = (
+                                avg_losses[name]
+                                if isinstance(avg_losses, dict)
+                                else avg_losses
+                            )
 
                         if wandb is not None:
                             wandb.log(info, step=step)
@@ -1041,15 +1095,26 @@ class Trainer:
                 avg_per_sequence_l0.clear()
                 avg_per_batch_l0.clear()
                 avg_per_feature_l0.clear()
+                avg_per_token_l1.clear()
+                avg_per_sequence_l1.clear()
+                avg_per_batch_l1.clear()
+                avg_per_feature_l1.clear()
                 avg_mse_loss.clear()
+                avg_norm_mse_loss.clear()
                 avg_l2_ratio.clear()
+                avg_cossim.clear()
                 avg_frac_dead.clear()
+                avg_relative_reconstruction_bias.clear()
                 avg_ce = 0.0
                 avg_kl = 0.0
                 avg_acc_top1 = 0.0
 
             self.global_step += 1
             pbar.update()
+
+            if self.global_step >= self.cfg.max_steps:
+                print("Early stop with reaching maximum training steps.")
+                break
 
         self.save()
         if self.cfg.save_best:

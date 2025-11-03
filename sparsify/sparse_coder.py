@@ -50,8 +50,23 @@ class ForwardOutput:
     per_feature_l0: float = 0.0
     """L0 sparsity (number of latents used) per feature."""
 
+    per_token_l1: float = 0.0
+    """L1 sparsity (sum of absolute latent activations) per token."""
+
+    per_sequence_l1: float = 0.0
+    """L1 sparsity (sum of absolute latent activations) per sequence."""
+
+    per_batch_l1: float = 0.0
+    """L1 sparsity (sum of absolute latent activations) per batch."""
+
+    per_feature_l1: float = 0.0
+    """L1 sparsity (sum of absolute latent activations) per feature."""
+
     mse_loss: float = 0.0
     """MSE loss."""
+
+    norm_mse_loss: float = 0.0
+    """Normalized MSE loss."""
 
     frac_dead: float = 0.0
     """Fraction of dead latents."""
@@ -251,8 +266,13 @@ class MidDecoder:
             # SSE (Sum of Squared Errors)
             sse = e.pow(2).sum()
 
-            # MSE (L2) loss
+            # Standard MSE (L2) loss
             mse_loss = e.pow(2).mean()
+
+            # Norm MSE
+            y_centered = y - y.mean(0, keepdim=True)
+            normalization = y_centered.norm(dim=-1, keepdim=True)
+            norm_mse_loss = (e / (normalization + 1e-6)).pow(2).mean()
 
             # fraction of variance unexplained (FVU)
             fvu = sse / total_variance
@@ -260,13 +280,15 @@ class MidDecoder:
             # fraction of variance explained (FVE)
             fve = 1.0 - fvu
 
-            # L2 ratio
-            l2_ratio = (
-                torch.linalg.norm(y_hat, dim=-1) / torch.linalg.norm(y, dim=-1)
-            ).mean()
+            # L2 norm
+            l2_norm_in = torch.norm(y, dim=-1)
+            l2_norm_out = torch.norm(y_hat, dim=-1)
+            l2_norm_in_for_div = l2_norm_in.clone()
+            # l2_norm_in_for_div[torch.abs(l2_norm_in_for_div) < 1e-4] = 1
+            l2_ratio = (l2_norm_out / l2_norm_in_for_div).mean()
 
             # Relative reconstruction bias
-            y_hat_norm_squared = torch.linalg.norm(y_hat, dim=-1, ord=2).pow(2)
+            y_hat_norm_squared = torch.norm(y_hat, dim=-1).pow(2)
             y_dot_y_hat = (y * y_hat).sum(dim=-1)
             relative_reconstruction_bias = (
                 y_hat_norm_squared.mean() / y_dot_y_hat.mean()
@@ -277,8 +299,8 @@ class MidDecoder:
             y_hat_normed = y_hat / torch.linalg.norm(y_hat, dim=-1, keepdim=True)
             cossim = (y_normed * y_hat_normed).sum(dim=-1).mean()
 
+            # L0 & L1 sparsity: fraction of latents used
             context_stripe = 128
-            # L0 sparsity: fraction of latents used
             per_token_l0 = (
                 (latent_acts != 0).float().sum(dim=-1).mean()
             )  # Shape: Scalar
@@ -298,6 +320,13 @@ class MidDecoder:
             per_feature_l0 = (
                 (latent_acts != 0).float().sum(dim=0)
             )  # Shape: (num_latents,)
+
+            per_token_l1 = latent_acts.abs().sum().mean()  # Shape: Scalar
+            per_sequence_l1 = (
+                latent_acts_reshaped.abs().sum(dim=(1, 2)).mean()
+            )  # Shape: Scalar
+            per_batch_l1 = latent_acts.abs().sum()  # batch l1, Scalar
+            per_feature_l1 = latent_acts.abs().sum(dim=0)  # Shape: (num_latents,)
 
             # fraction of dead latents
             if self.dead_mask is not None:
@@ -324,7 +353,12 @@ class MidDecoder:
                 per_sequence_l0=per_sequence_l0,
                 per_batch_l0=per_batch_l0,
                 per_feature_l0=per_feature_l0,
+                per_token_l1=per_token_l1,
+                per_sequence_l1=per_sequence_l1,
+                per_batch_l1=per_batch_l1,
+                per_feature_l1=per_feature_l1,
                 mse_loss=mse_loss,
+                norm_mse_loss=norm_mse_loss,
                 frac_dead=frac_dead,
                 cossim=cossim,
                 l2_ratio=l2_ratio,

@@ -97,9 +97,17 @@ def load_artifacts(
     else:
         dtype = "auto"
 
+    from liger_kernel.transformers import AutoLigerKernelForCausalLM
+
     # End-to-end training requires a model with a causal LM head
-    model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
-    # model_cls = AutoModelForCausalLM
+    # model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
+    # if "olmoe" in args.model.lower():
+    # model_cls = AutoModel
+    # else:
+    # model_cls = AutoLigerKernelForCausalLM
+
+    model_cls = AutoModel
+
     model = model_cls.from_pretrained(
         args.model,
         device_map={"": f"cuda:{rank}"},
@@ -231,6 +239,7 @@ def run():
         print(f"Training on '{args.dataset}' (split '{args.split}')")
         print(f"Storing model weights in {model.dtype}")
 
+        # breakpoint()
         trainer = Trainer(args, dataset, model, mesh)
         if args.resume:
             trainer.load_state(f"checkpoints/{args.run_name}")
@@ -249,7 +258,12 @@ def run():
                         f"{args.finetune}/{name}",
                     )
 
+        # breakpoint()
         trainer.fit()
+
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

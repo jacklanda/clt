@@ -103,6 +103,9 @@ class TrainConfig(Serializable):
     batch_size: int = 32
     """Batch size measured in sequences."""
 
+    max_steps: int = 1_048_576
+    """Maximum number of training steps."""
+
     grad_acc_steps: int = 1
     """Number of steps over which to accumulate gradients."""
 
@@ -169,7 +172,7 @@ class TrainConfig(Serializable):
     hookpoints_in: list[str] = list_field()
     """List of input hookpoints for sparse coders."""
 
-    init_seeds: list[int] = list_field(0)
+    init_seeds: list[int] = list_field(42)
     """List of random seeds to use for initialization. If more than one, train a sparse
     coder for each seed."""
 
@@ -208,6 +211,7 @@ class TrainConfig(Serializable):
 
     log_to_wandb: bool = True
     run_name: str | None = None
+    run_id: str | None = None
     wandb_log_frequency: int = 1
 
     save_dir: str = "checkpoints"
