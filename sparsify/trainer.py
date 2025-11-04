@@ -70,6 +70,12 @@ class Trainer:
         # Store the whole model, including any potential causal LM wrapper
         self.model = model
 
+        if cfg.gradient_checkpointing and hasattr(
+            self.model, "gradient_checkpointing_enable"
+        ):
+            self.model.gradient_checkpointing_enable()
+            print("Enabled gradient checkpointing for base model.")
+
         if cfg.hookpoints:
             assert not cfg.layers, "Cannot specify both `hookpoints` and `layers`."
 
@@ -272,6 +278,7 @@ class Trainer:
 
         print(f"Learning rates: {lrs}" if len(lrs) > 1 else f"Learning rate: {lrs[0]}")
         self.global_step = 0
+        self.update_step = 0
         self.num_tokens_since_fired = {
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
             for name, sae in self.saes.items()
@@ -433,14 +440,28 @@ class Trainer:
             p.numel() for s in self.saes.values() for p in s.parameters()
         )
         num_model_params = sum(p.numel() for p in self.model.parameters())
+        global_batch_size = (
+            self.cfg.batch_size
+            * self.cfg.ctx_len
+            * self.cfg.grad_acc_steps
+            * self.cfg.micro_acc_steps
+        )
+        print(f"Global batch size: {global_batch_size:_}")
         print(f"Number of CLT parameters: {num_sae_params:_}")
         print(f"Number of model parameters: {num_model_params:_}")
 
-        num_batches = len(self.dataset) // self.cfg.batch_size
+        num_batches = len(self.dataset) // (
+            self.cfg.batch_size * self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+        )
         if self.global_step > 0:
             assert hasattr(self.dataset, "select"), "Dataset must implement `select`"
 
-            n = self.global_step * self.cfg.batch_size
+            n = (
+                self.global_step
+                * self.cfg.batch_size
+                * self.cfg.grad_acc_steps
+                * self.cfg.micro_acc_steps
+            )
             if self.cfg.restart_epoch:
                 n = 0
                 num_batches += len(self.dataset) // self.cfg.batch_size
@@ -855,9 +876,7 @@ class Trainer:
                 dead_latent_loss = 0.0
                 if self.cfg.dead_latent_penalty > 0.0:
                     if isinstance(raw.W_dec, DTensor):
-                        norms = (
-                            raw.W_dec.pow(2).sum(dim=-1).add(1e-10).sqrt()
-                        )  # .detach()
+                        norms = raw.W_dec.pow(2).sum(dim=-1).add(1e-10).sqrt()
                     else:
                         norms = raw.W_dec.norm(dim=-1)
                     dead_latent_loss = DeadLatentLoss.apply(
@@ -882,10 +901,6 @@ class Trainer:
             del loss
 
             runner.restore()
-
-        if self.cfg.log_to_wandb:
-            train_batch_size = self.cfg.batch_size * self.cfg.ctx_len
-            wandb.log({"train/batch_size": train_batch_size})
 
         for batch in dl:
             x = self.input_ids_to_mesh(batch["input_ids"])
@@ -1008,7 +1023,9 @@ class Trainer:
                     handle.remove()
 
             # Check if we need to actually do a training step
-            step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
+            step, substep = divmod(
+                self.global_step + 1, self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+            )
             if substep == 0:
                 if self.cfg.sae.normalize_decoder and not self.cfg.sae.transcode:
                     for sae in self.saes.values():
@@ -1090,7 +1107,11 @@ class Trainer:
                             self.dataset
                         )
                         info["train/seen_tokens"] = seen_tokens = (
-                            seen_tokens + self.cfg.batch_size * self.cfg.ctx_len
+                            seen_tokens
+                            + self.cfg.batch_size
+                            * self.cfg.ctx_len
+                            * self.cfg.grad_acc_steps
+                            * self.cfg.micro_acc_steps
                         )
                         for name in self.cfg.hookpoints:
                             info[f"loss/{name}"] = (
@@ -1121,8 +1142,10 @@ class Trainer:
                 avg_kl = 0.0
                 avg_acc_top1 = 0.0
 
+                pbar.update()
+                self.update_step += 1
+
             self.global_step += 1
-            pbar.update()
 
             if self.global_step >= self.cfg.max_steps:
                 print("Early stop with reaching maximum training steps.")
@@ -1212,7 +1235,7 @@ class Trainer:
                 torch.save(scheduler.state_dict(), f"{path}/lr_scheduler_{i}.pt")
 
             torch.save(
-                {"global_step": self.global_step},
+                {"global_step": self.update_step},
                 f"{path}/state.pt",
             )
 

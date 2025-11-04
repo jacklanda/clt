@@ -106,6 +106,9 @@ class TrainConfig(Serializable):
     max_steps: int = 1_048_576
     """Maximum number of training steps."""
 
+    gradient_checkpointing: bool = False
+    """Enable gradient checkpointing."""
+
     grad_acc_steps: int = 1
     """Number of steps over which to accumulate gradients."""
 
