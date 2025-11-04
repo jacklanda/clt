@@ -100,13 +100,11 @@ def load_artifacts(
     from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
     # End-to-end training requires a model with a causal LM head
-    # model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
+    model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
     # if "olmoe" in args.model.lower():
     # model_cls = AutoModel
     # else:
     # model_cls = AutoLigerKernelForCausalLM
-
-    model_cls = AutoModel
 
     model = model_cls.from_pretrained(
         args.model,
@@ -122,9 +120,8 @@ def load_artifacts(
     )
 
     if torch.distributed.is_initialized() and DISTRIBUTE_MODEL:
-        # TODO: sdpa doesn't shard correctly
-        # model.config._attn_implementation = "eager"
-        pass
+        # Force eager attention implementation to avoid DTensor issues
+        model.config._attn_implementation = "sdpa"
     model.config.use_cache = False
 
     # For memmap-style datasets

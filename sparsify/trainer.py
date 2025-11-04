@@ -461,6 +461,7 @@ class Trainer:
             disable=not rank_zero,
             initial=self.global_step,
             total=num_batches,
+            leave=False,
         )
 
         did_fire = {
@@ -485,7 +486,6 @@ class Trainer:
         avg_per_feature_l1 = defaultdict(float)
         avg_mse_loss = defaultdict(float)
         avg_norm_mse_loss = defaultdict(float)
-        avg_frac_dead = defaultdict(float)
         avg_l2_ratio = defaultdict(float)
         avg_cossim = defaultdict(float)
         avg_relative_reconstruction_bias = defaultdict(float)
@@ -843,7 +843,6 @@ class Trainer:
                 avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / denom)
                 avg_mse_loss[name] += float(out.mse_loss / denom)
                 avg_norm_mse_loss[name] += float(out.norm_mse_loss / denom)
-                avg_frac_dead[name] += float(out.frac_dead / denom)
                 avg_l2_ratio[name] += float(out.l2_ratio / denom)
                 avg_cossim[name] += float(out.cossim / denom)
                 avg_relative_reconstruction_bias[name] += float(
@@ -884,6 +883,10 @@ class Trainer:
 
             runner.restore()
 
+        if self.cfg.log_to_wandb:
+            train_batch_size = self.cfg.batch_size * self.cfg.ctx_len
+            wandb.log({"train/batch_size": train_batch_size})
+
         for batch in dl:
             x = self.input_ids_to_mesh(batch["input_ids"])
             if self.model.config.bos_token_id is not None:
@@ -893,7 +896,18 @@ class Trainer:
             if not self.cfg.filter_bos:
                 bos_mask[:] = False
             if self.cfg.remove_first_token:
-                bos_mask[:, 0] = True
+                # bos_mask[:, 0] = True
+                # Convert DTensor to local tensor if needed
+                if isinstance(bos_mask, DTensor):
+                    local_mask = bos_mask.to_local()
+                    local_mask[:, 0] = True
+                    bos_mask = DTensor.from_local(
+                        local_mask,
+                        device_mesh=bos_mask.device_mesh,
+                        placements=bos_mask.placements,
+                    )
+                else:
+                    bos_mask[:, 0] = True
 
             runner.reset()
 
@@ -1053,7 +1067,6 @@ class Trainer:
 
                         info[f"mse(l2)/{name}"] = avg_mse_loss[name]
                         info[f"norm_mse/{name}"] = avg_norm_mse_loss[name]
-                        info[f"frac_dead/{name}"] = avg_frac_dead[name]
 
                         info[f"l0(per_token)/{name}"] = avg_per_token_l0[name]
                         info[f"l0(per_sequence)/{name}"] = avg_per_sequence_l0[name]
@@ -1103,7 +1116,6 @@ class Trainer:
                 avg_norm_mse_loss.clear()
                 avg_l2_ratio.clear()
                 avg_cossim.clear()
-                avg_frac_dead.clear()
                 avg_relative_reconstruction_bias.clear()
                 avg_ce = 0.0
                 avg_kl = 0.0

@@ -153,7 +153,7 @@ def resolve_widths(
         # 2. The caller already wraps this in implicit_replication() context
         # 3. Some models (e.g., MoE) have operations incompatible with DTensor
         dummy = {
-            k: v.to(model.device) if mesh is None else distribute_tensor(v, mesh)
+            k: v.to(model.device)
             for k, v in model.dummy_inputs.items()
         }
         try:
