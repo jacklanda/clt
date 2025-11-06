@@ -207,12 +207,12 @@ def run():
     # Prevent ranks other than 0 from printing
     with nullcontext() if rank == 0 else redirect_stdout(None):
         # Awkward hack to prevent other ranks from duplicating data preprocessing
-        if not distributed or rank == 0:
-            model, dataset, tokenizer = load_artifacts(args, rank)
+        # if not distributed or rank == 0:
+        # model, dataset, tokenizer = load_artifacts(args, rank)
         if distributed:
             dist.barrier()
-            if rank != 0:
-                model, dataset, tokenizer = load_artifacts(args, rank)
+            # if rank != 0:
+            model, dataset, tokenizer = load_artifacts(args, rank)
             dist.barrier()
 
             if DISTRIBUTE_MODEL:

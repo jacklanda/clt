@@ -86,6 +86,9 @@ class ForwardOutput:
     frac_dead: float = 0.0
     """Fraction of dead latents."""
 
+    frac_alive: float = 0.0
+    """Fraction of alive latents."""
+
     cossim: float = 0.0
     """Cosine similarity between target and reconstruction."""
 
@@ -398,6 +401,11 @@ class MidDecoder:
             else:
                 frac_dead = torch.tensor(0.0)
 
+            assert len(latent_acts.shape) == 2, "latent_acts must be 2D"
+            frac_alive = (
+                latent_acts.sum(dim=0) != 0
+            ).float().sum() / latent_acts.shape[1]
+
             # Cross-entropy losses of language models (optional)
             loss_original = torch.tensor(0.0)
             loss_reconstructed = torch.tensor(0.0)
@@ -482,6 +490,7 @@ class MidDecoder:
                 mse_loss=mse_loss,
                 norm_mse_loss=norm_mse_loss,
                 frac_dead=frac_dead,
+                frac_alive=frac_alive,
                 cossim=cossim,
                 relative_reconstruction_bias=relative_reconstruction_bias,
                 loss_original=loss_original.item(),
