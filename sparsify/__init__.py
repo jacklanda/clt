@@ -5,14 +5,32 @@ from .runner import CrossLayerRunner
 from .sparse_coder import Sae, SparseCoder
 from .trainer import SaeTrainer, Trainer
 
-__all__ = [
-    "Sae",
-    "SaeConfig",
-    "SaeTrainer",
-    "SparseCoder",
-    "SparseCoderConfig",
-    "CrossLayerRunner",
-    "Trainer",
-    "TrainConfig",
-    "TranscoderConfig",
-]
+# Optional evaluation imports (requires nnsight)
+try:
+    from .evaluation import loss_recovered, compute_frac_recovered
+    __all__ = [
+        "Sae",
+        "SaeConfig",
+        "SaeTrainer",
+        "SparseCoder",
+        "SparseCoderConfig",
+        "CrossLayerRunner",
+        "Trainer",
+        "TrainConfig",
+        "TranscoderConfig",
+        "loss_recovered",
+        "compute_frac_recovered",
+    ]
+except ImportError:
+    # nnsight not available, skip evaluation imports
+    __all__ = [
+        "Sae",
+        "SaeConfig",
+        "SaeTrainer",
+        "SparseCoder",
+        "SparseCoderConfig",
+        "CrossLayerRunner",
+        "Trainer",
+        "TrainConfig",
+        "TranscoderConfig",
+    ]

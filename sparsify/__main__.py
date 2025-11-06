@@ -89,7 +89,7 @@ class RunConfig(TrainConfig):
 
 def load_artifacts(
     args: RunConfig, rank: int, limit_before_processing: bool = False
-) -> tuple[PreTrainedModel, Dataset | MemmapDataset]:
+) -> tuple[PreTrainedModel, Dataset | MemmapDataset, AutoTokenizer | None]:
     if args.load_in_8bit:
         dtype = torch.float16
     elif torch.cuda.is_bf16_supported():
@@ -164,7 +164,7 @@ def load_artifacts(
         if limit := args.max_examples:
             dataset = dataset.select(range(limit))
 
-    return model, dataset
+    return model, dataset, tokenizer
 
 
 def run():
@@ -208,11 +208,11 @@ def run():
     with nullcontext() if rank == 0 else redirect_stdout(None):
         # Awkward hack to prevent other ranks from duplicating data preprocessing
         if not distributed or rank == 0:
-            model, dataset = load_artifacts(args, rank)
+            model, dataset, tokenizer = load_artifacts(args, rank)
         if distributed:
             dist.barrier()
             if rank != 0:
-                model, dataset = load_artifacts(args, rank)
+                model, dataset, tokenizer = load_artifacts(args, rank)
             dist.barrier()
 
             if DISTRIBUTE_MODEL:
@@ -237,7 +237,7 @@ def run():
         print(f"Storing model weights in {model.dtype}")
 
         # breakpoint()
-        trainer = Trainer(args, dataset, model, mesh)
+        trainer = Trainer(args, dataset, model, tokenizer, mesh)
         if args.resume:
             trainer.load_state(f"checkpoints/{args.run_name}")
         elif args.finetune:

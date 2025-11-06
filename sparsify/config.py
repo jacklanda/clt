@@ -195,6 +195,9 @@ class TrainConfig(Serializable):
     tp: int = 1
     """Number of tensor parallel ranks to use."""
 
+    compute_nll_loss: bool = False
+    """Compute the NLL loss of the final model logits."""
+
     @property
     def distribute_modules(self) -> bool:
         """Whether to distribute the modules across ranks."""

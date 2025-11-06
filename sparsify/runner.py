@@ -1,3 +1,4 @@
+from typing import List
 from dataclasses import replace
 
 import torch
@@ -123,6 +124,7 @@ class CrossLayerRunner(object):
                 new_mid_out = mid_out.copy(
                     indices=best_indices,
                     activations=best_values,
+                    dead_mask=kwargs.pop("loss_mask"),
                 )
                 out = new_mid_out(y, index=0, add_post_enc=False, **kwargs)
                 if advance:

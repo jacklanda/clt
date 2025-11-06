@@ -18,7 +18,10 @@ from torch.distributed.tensor.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental import implicit_replication
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import PreTrainedModel, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, PreTrainedModel, get_linear_schedule_with_warmup
+from nnsight import LanguageModel
+from liger_kernel.transformers import AutoLigerKernelForCausalLM
+from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
 
 from .config import TrainConfig
 from .data import MemmapDataset
@@ -64,11 +67,14 @@ class Trainer:
         cfg: TrainConfig,
         dataset: HfDataset | MemmapDataset,
         model: PreTrainedModel,
+        tokenizer: AutoTokenizer | None = None,
         mesh: DeviceMesh | None = None,
     ):
         self.mesh = mesh
         # Store the whole model, including any potential causal LM wrapper
         self.model = model
+        self.tokenizer = tokenizer
+        self.lm = self._load_nnsight_lm(cfg.model) if cfg.compute_nll_loss else None
 
         if cfg.gradient_checkpointing and hasattr(
             self.model, "gradient_checkpointing_enable"
@@ -297,6 +303,18 @@ class Trainer:
         )
 
         self.model.eval()
+
+    def _load_nnsight_lm(self, model_path: str) -> LanguageModel:
+        """Load an NNSight LanguageModel."""
+        # Load model
+        return LanguageModel(
+            model_path,
+            device_map="auto",
+            dtype=torch.bfloat16,
+            # automodel=AutoLigerKernelForCausalLM if ,
+            # attn_implementation="sdpa",
+            dispatch=True,
+        )
 
     def load_state(self, path: str):
         """Load the trainer state from disk."""
@@ -819,6 +837,10 @@ class Trainer:
                 module_name=name,
                 detach_grad=loss_fn == "fvu",
                 loss_mask=(~bos_mask_mesh if loss_fn == "fvu" else None),
+                compute_nll_loss=self.cfg.compute_nll_loss,
+                texts=texts,
+                lm=self.lm,
+                submodule=name,
             )
             output = out.y_hat
 
@@ -921,6 +943,11 @@ class Trainer:
 
         for batch in dl:
             x = self.input_ids_to_mesh(batch["input_ids"])
+            texts = (
+                self.tokenizer.batch_decode(batch["input_ids"])
+                if self.cfg.compute_nll_loss
+                else None
+            )
             if self.model.config.bos_token_id is not None:
                 bos_mask = x == self.model.config.bos_token_id
             else:
@@ -1032,7 +1059,7 @@ class Trainer:
                             fvu_losses.clear()
                         case "fvu":
                             self.model(x)
-                            avg_losses = dict(avg_explained_variance)
+                            avg_losses = dict(avg_unexplained_variance)
                         case other:
                             raise ValueError(f"Unknown loss function '{other}'")
             finally:

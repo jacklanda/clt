@@ -3,7 +3,7 @@ import json
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import einops
 import torch
@@ -14,6 +14,8 @@ from safetensors.torch import load_file
 from torch import Tensor, nn
 from torch.distributed import tensor as dtensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
+from transformers import AutoModel
+from nnsight import LanguageModel
 
 from .config import SparseCoderConfig
 from .fused_encoder import NO_COMPILE, EncoderOutput, fused_encoder
@@ -90,6 +92,18 @@ class ForwardOutput:
     relative_reconstruction_bias: float = 0.0
     """Relative reconstruction bias."""
 
+    loss_original: float = 0.0
+    """Original model cross-entropy loss (for language models)."""
+
+    loss_reconstructed: float = 0.0
+    """Cross-entropy loss with sparse coder reconstruction (for language models)."""
+
+    loss_zero: float = 0.0
+    """Cross-entropy loss with component zeroed out (for language models)."""
+
+    frac_recovered: float = 0.0
+    """Fraction of loss recovered: (loss_reconstructed - loss_zero) / (loss_original - loss_zero)."""
+
 
 class MidDecoder:
     def __init__(
@@ -113,6 +127,9 @@ class MidDecoder:
         activations: Tensor | None = None,
         indices: Tensor | None = None,
         dead_mask: Tensor | None = None,
+        texts: List[str] | None = None,
+        lm: AutoModel | None = None,
+        submodule: str | None = None,
     ):
         if x is None:
             x = self.x
@@ -122,7 +139,13 @@ class MidDecoder:
             indices = self.latent_indices
         if dead_mask is None:
             dead_mask = self.dead_mask
-        return MidDecoder(self.sparse_coder, x, activations, indices, dead_mask)
+        return MidDecoder(
+            self.sparse_coder,
+            x,
+            activations,
+            indices,
+            dead_mask,
+        )
 
     def detach(self):
         if not hasattr(self, "original_activations"):
@@ -211,6 +234,11 @@ class MidDecoder:
         denormalize: bool = True,
         add_post_enc: bool = True,
         loss_mask: Tensor | None = None,
+        # Optional parameters for cross-entropy loss calculation
+        compute_nll_loss: bool = False,
+        lm: LanguageModel = None,  # nnsight LanguageModel
+        submodule: str = None,  # submodule to intervene on
+        texts: List[str] = None,  # text batch for loss calculation
     ) -> ForwardOutput:
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
@@ -268,12 +296,13 @@ class MidDecoder:
                 error = error * loss_mask[..., None]
 
             # Used as a denominator for putting everything on a reasonable scale
-            if loss_mask is None:
-                total_variance_old = (y - y.mean(0)).pow(2).sum()
-            else:
-                lm = loss_mask[..., None]
-                y_mean = (y * lm).sum(0) / lm.sum(0)
-                total_variance_old = (y - y_mean).pow(2).mul(lm).sum()
+            # if loss_mask is None:
+            # total_variance_old = (y - y.mean(0)).pow(2).sum()
+            # pass
+            # else:
+            # lm = loss_mask[..., None]
+            # y_mean = (y * lm).sum(0) / lm.sum(0)
+            # total_variance_old = (y - y_mean).pow(2).mul(lm).sum()
 
             # (per-token) MSE loss (A)
             # standard_mse_loss = error.pow(2).sum(dim=-1).mean()
@@ -369,11 +398,67 @@ class MidDecoder:
             else:
                 frac_dead = torch.tensor(0.0)
 
-            # TODO: add transcoding cross-entropy losses of language models
-            # - "loss_original"
-            # - "loss_transcoded"
-            # - "loss_zero"
-            # - "frac_recovered"
+            # Cross-entropy losses of language models (optional)
+            loss_original = torch.tensor(0.0)
+            loss_reconstructed = torch.tensor(0.0)
+            loss_zero = torch.tensor(0.0)
+            frac_recovered = torch.tensor(0.0)
+
+            if compute_nll_loss:
+                if lm is None or submodule is None or texts is None:
+                    raise ValueError(
+                        "compute_nll_loss=True requires lm, submodule, and texts to be provided"
+                    )
+
+                try:
+                    from .evaluation import (
+                        loss_recovered as compute_loss_recovered,
+                        compute_frac_recovered,
+                    )
+
+                    batched_loss_original = []
+                    batched_loss_reconstructed = []
+                    batched_loss_zero = []
+                    batched_frac_recovered = []
+
+                    # Compute cross-entropy losses
+                    for text in texts:
+                        loss_original, loss_reconstructed, loss_zero = (
+                            compute_loss_recovered(
+                                text=text,
+                                model=lm,
+                                submodule=submodule,
+                                sparse_coder=self.sparse_coder,
+                                normalize_batch=True,
+                                y_recon=y_hat,
+                            )
+                        )
+                        # Compute fraction recovered
+                        frac_recovered = compute_frac_recovered(
+                            loss_original, loss_reconstructed, loss_zero
+                        )
+                        batched_loss_original.append(loss_original)
+                        batched_loss_reconstructed.append(loss_reconstructed)
+                        batched_loss_zero.append(loss_zero)
+                        batched_frac_recovered.append(frac_recovered)
+                    loss_original = torch.stack(batched_loss_original).mean()
+                    loss_reconstructed = torch.stack(batched_loss_reconstructed).mean()
+                    loss_zero = torch.stack(batched_loss_zero).mean()
+                    frac_recovered = torch.stack(batched_frac_recovered).mean()
+                except ImportError as e:
+                    print(f"Warning: Could not import loss_recovered function: {e}")
+                    print("Cross-entropy losses will not be computed.")
+
+                print(
+                    "loss_original:",
+                    loss_original,
+                    "loss_reconstructed:",
+                    loss_reconstructed,
+                    "loss_zero:",
+                    loss_zero,
+                    "frac_recovered:",
+                    frac_recovered,
+                )
 
             return ForwardOutput(
                 y_hat=y_hat,
@@ -399,6 +484,10 @@ class MidDecoder:
                 frac_dead=frac_dead,
                 cossim=cossim,
                 relative_reconstruction_bias=relative_reconstruction_bias,
+                loss_original=loss_original.item(),
+                loss_reconstructed=loss_reconstructed.item(),
+                loss_zero=loss_zero.item(),
+                frac_recovered=frac_recovered.item(),
             )
 
 
