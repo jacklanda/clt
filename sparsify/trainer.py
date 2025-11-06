@@ -169,7 +169,9 @@ class Trainer:
                 )
 
         assert isinstance(dataset, Sized)
-        num_batches = len(dataset) // cfg.batch_size
+        num_batches = len(dataset) // (
+            cfg.batch_size * cfg.grad_acc_steps * cfg.micro_acc_steps
+        )
 
         match cfg.optimizer:
             case "adam" | "adam8":
@@ -495,8 +497,10 @@ class Trainer:
         num_tokens_in_step = 0
 
         # For logging purposes
-        avg_fvu = defaultdict(float)
-        avg_fve = defaultdict(float)
+        avg_explained_variance = defaultdict(float)
+        avg_explained_variance_legacy = defaultdict(float)
+        avg_unexplained_variance = defaultdict(float)
+        avg_unexplained_variance_legacy = defaultdict(float)
         avg_per_token_l0 = defaultdict(float)
         avg_per_sequence_l0 = defaultdict(float)
         avg_per_batch_l0 = defaultdict(float)
@@ -507,6 +511,7 @@ class Trainer:
         avg_per_feature_l1 = defaultdict(float)
         avg_mse_loss = defaultdict(float)
         avg_norm_mse_loss = defaultdict(float)
+        avg_l2_loss = defaultdict(float)
         avg_l2_ratio = defaultdict(float)
         avg_cossim = defaultdict(float)
         avg_relative_reconstruction_bias = defaultdict(float)
@@ -824,7 +829,7 @@ class Trainer:
             assert isinstance(out, ForwardOutput)
 
             if self.cfg.loss_fn == "kl-fvu":
-                fvu_losses[name] = float(out.fvu.detach().mean())
+                fvu_losses[name] = float(out.unexplained_variance.detach().mean())
 
             # Update the did_fire mask
             latent_indices = encoding.latent_indices.flatten()
@@ -852,8 +857,18 @@ class Trainer:
                 # Replace the normal output with the SAE output
                 return (output, *aux_out) if aux_out is not None else output
             else:
-                avg_fvu[name] += float(out.fvu.detach().mean() / denom)
-                avg_fve[name] += float(out.fve.detach().mean() / denom)
+                avg_explained_variance[name] += float(
+                    out.explained_variance.detach() / denom
+                )
+                avg_explained_variance_legacy[name] += float(
+                    out.explained_variance_legacy.detach() / denom
+                )
+                avg_unexplained_variance[name] += float(
+                    out.unexplained_variance.detach() / denom
+                )
+                avg_unexplained_variance_legacy[name] += float(
+                    out.unexplained_variance_legacy.detach() / denom
+                )
                 avg_per_token_l0[name] += float(out.per_token_l0 / denom)
                 avg_per_sequence_l0[name] += float(out.per_sequence_l0 / denom)
                 avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / denom)
@@ -864,6 +879,7 @@ class Trainer:
                 avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / denom)
                 avg_mse_loss[name] += float(out.mse_loss / denom)
                 avg_norm_mse_loss[name] += float(out.norm_mse_loss / denom)
+                avg_l2_loss[name] += float(out.l2_loss / denom)
                 avg_l2_ratio[name] += float(out.l2_ratio / denom)
                 avg_cossim[name] += float(out.cossim / denom)
                 avg_relative_reconstruction_bias[name] += float(
@@ -893,7 +909,8 @@ class Trainer:
                     dead_latent_loss = dead_latent_loss + active_correction
 
                 loss = (
-                    out.fvu.mean() + self.cfg.dead_latent_penalty * dead_latent_loss
+                    out.unexplained_variance
+                    + self.cfg.dead_latent_penalty * dead_latent_loss
                 ) / acc_steps
 
                 # Do a "local" backward pass if we're not training end-to-end
@@ -1015,7 +1032,7 @@ class Trainer:
                             fvu_losses.clear()
                         case "fvu":
                             self.model(x)
-                            avg_losses = dict(avg_fvu)
+                            avg_losses = dict(avg_explained_variance)
                         case other:
                             raise ValueError(f"Unknown loss function '{other}'")
             finally:
@@ -1079,10 +1096,20 @@ class Trainer:
                         ratio = mask.mean(dtype=torch.float32).item()
                         info.update({f"dead_pct/{name}": ratio})
                         if "fvu" in self.cfg.loss_fn:
-                            info[f"fvu/{name}"] = avg_fvu[name]
-                            info[f"fve/{name}"] = avg_fve[name]
+                            info[f"explained_variance/{name}"] = avg_explained_variance[
+                                name
+                            ]
+                            info[f"explained_variance_legacy/{name}"] = (
+                                avg_explained_variance_legacy[name]
+                            )
+                            info[f"unexplained_variance/{name}"] = (
+                                avg_unexplained_variance[name]
+                            )
+                            info[f"unexplained_variance_legacy/{name}"] = (
+                                avg_unexplained_variance_legacy[name]
+                            )
 
-                        info[f"mse(l2)/{name}"] = avg_mse_loss[name]
+                        info[f"mse/{name}"] = avg_mse_loss[name]
                         info[f"norm_mse/{name}"] = avg_norm_mse_loss[name]
 
                         info[f"l0(per_token)/{name}"] = avg_per_token_l0[name]
@@ -1093,6 +1120,7 @@ class Trainer:
                         info[f"l1(per_sequence)/{name}"] = avg_per_sequence_l1[name]
                         info[f"l1(per_batch)/{name}"] = avg_per_batch_l1[name]
                         info[f"l1(per_feature)/{name}"] = avg_per_feature_l1[name]
+                        info[f"l2/{name}"] = avg_l2_loss[name]
                         info[f"l2_ratio/{name}"] = avg_l2_ratio[name]
                         info[f"cossim/{name}"] = avg_cossim[name]
                         info[f"relative_reconstruction_bias/{name}"] = (
@@ -1123,8 +1151,10 @@ class Trainer:
                         if wandb is not None:
                             wandb.log(info, step=step)
 
-                avg_fvu.clear()
-                avg_fve.clear()
+                avg_explained_variance.clear()
+                avg_explained_variance_legacy.clear()
+                avg_unexplained_variance.clear()
+                avg_unexplained_variance_legacy.clear()
                 avg_per_token_l0.clear()
                 avg_per_sequence_l0.clear()
                 avg_per_batch_l0.clear()
@@ -1135,6 +1165,7 @@ class Trainer:
                 avg_per_feature_l1.clear()
                 avg_mse_loss.clear()
                 avg_norm_mse_loss.clear()
+                avg_l2_loss.clear()
                 avg_l2_ratio.clear()
                 avg_cossim.clear()
                 avg_relative_reconstruction_bias.clear()

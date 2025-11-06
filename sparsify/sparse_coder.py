@@ -1,5 +1,5 @@
-import json
 import os
+import json
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
@@ -7,6 +7,7 @@ from typing import Optional
 
 import einops
 import torch
+import einops
 from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors.torch import load_file
@@ -29,11 +30,17 @@ class ForwardOutput:
     latent_indices: Tensor
     """Indices of the top-k features."""
 
-    fvu: Tensor
-    """Fraction of variance unexplained."""
+    explained_variance: Tensor
+    """Explained variance."""
 
-    fve: Tensor
-    """Fraction of variance explained."""
+    explained_variance_legacy: Tensor
+    """Explained variance (legacy computation)."""
+
+    unexplained_variance: Tensor
+    """Fraction of variance unexplained (1 - explained variance)."""
+
+    unexplained_variance_legacy: Tensor
+    """Fraction of variance unexplained (1 - explained variance, legacy computation)."""
 
     is_last: bool = False
     """Whether this is the last target in a multi-target setup."""
@@ -62,6 +69,12 @@ class ForwardOutput:
     per_feature_l1: float = 0.0
     """L1 sparsity (sum of absolute latent activations) per feature."""
 
+    l2_loss: float = 0.0
+    """L2 loss."""
+
+    l2_ratio: float = 0.0
+    """L2 ratio between reconstruction and target."""
+
     mse_loss: float = 0.0
     """MSE loss."""
 
@@ -73,9 +86,6 @@ class ForwardOutput:
 
     cossim: float = 0.0
     """Cosine similarity between target and reconstruction."""
-
-    l2_ratio: float = 0.0
-    """L2 ratio between reconstruction and target."""
 
     relative_reconstruction_bias: float = 0.0
     """Relative reconstruction bias."""
@@ -165,6 +175,7 @@ class MidDecoder:
             post_enc_scale = None
 
         latent_acts = self.latent_acts
+
         if isinstance(latent_acts, dtensor.DTensor):
             latent_acts = latent_acts.to_local()
             latent_indices = self.latent_indices.to_local()
@@ -183,6 +194,7 @@ class MidDecoder:
             )
             if post_enc_scale is not None:
                 latent_acts = latent_acts * post_enc_scale[self.latent_indices]
+
         return latent_acts
 
     @torch.autocast(
@@ -251,34 +263,56 @@ class MidDecoder:
             )
         else:
             # Compute the residual
-            e = y - y_hat
+            error = y - y_hat
             if loss_mask is not None:
-                e = e * loss_mask[..., None]
+                error = error * loss_mask[..., None]
 
             # Used as a denominator for putting everything on a reasonable scale
             if loss_mask is None:
-                total_variance = (y - y.mean(0)).pow(2).sum()
+                total_variance_old = (y - y.mean(0)).pow(2).sum()
             else:
                 lm = loss_mask[..., None]
                 y_mean = (y * lm).sum(0) / lm.sum(0)
-                total_variance = (y - y_mean).pow(2).mul(lm).sum()
+                total_variance_old = (y - y_mean).pow(2).mul(lm).sum()
 
-            # SSE (Sum of Squared Errors)
-            sse = e.pow(2).sum()
+            # (per-token) MSE loss (A)
+            # standard_mse_loss = error.pow(2).sum(dim=-1).mean()
 
-            # Standard MSE (L2) loss
-            mse_loss = e.pow(2).mean()
+            # (per-token) MSE loss (B): https://github.com/ckkissane/crosscoder-model-diff-replication/blob/main/crosscoder.py#L102-L105
+            # A is equivalent to B in result
+            squared_error = error.pow(2)
+            squared_error_per_batch = einops.reduce(
+                squared_error, "bsz neuron -> bsz", "sum"
+            )
+            mse_loss = squared_error_per_batch.mean()
 
-            # Norm MSE
+            # Norm MSE: https://github.com/decoderesearch/SAELens/blob/main/tests/_comparison/sae_lens_old/training/training_sae.py#L538-L545
             y_centered = y - y.mean(0, keepdim=True)
             normalization = y_centered.norm(dim=-1, keepdim=True)
-            norm_mse_loss = (e / (normalization + 1e-6)).pow(2).mean()
+            norm_mse_loss = (error / (normalization + 1e-6)).pow(2).sum(dim=-1).mean()
+            # norm_mse_loss = torch.nn.functional.mse_loss(y_hat, y, reduction="none") / (
+            # normalization + 1e-6
+            # )
 
-            # fraction of variance unexplained (FVU)
-            fvu = sse / total_variance
+            # explained_variance (legacy & new): https://github.com/decoderesearch/SAELens/pull/443
+            resid_sum_of_squares = error.pow(2).sum(dim=-1)
+            batched_variance_sum = (y - y.mean(dim=0)).pow(2).sum(dim=-1)
+            explained_variance_legacy = 1 - (
+                resid_sum_of_squares / batched_variance_sum
+            ).mean(dim=0)
+
+            mean_sum_of_squares = y.pow(2).sum(dim=-1).mean(dim=0)
+            mean_act_per_dimension = y.pow(2).mean()
+            residual_variance = resid_sum_of_squares.mean(dim=0)
+            total_variance_new = mean_sum_of_squares - mean_act_per_dimension.pow(2)
+            explained_variance = 1 - residual_variance / total_variance_new
 
             # fraction of variance explained (FVE)
-            fve = 1.0 - fvu
+            unexplained_variance_legacy = 1.0 - explained_variance_legacy
+            unexplained_variance = 1.0 - explained_variance
+
+            # L2 loss: https://github.com/science-of-finetuning/sparsity-artifacts-crosscoders/blob/ad9d9dd777624638b9c0c33d5e21fdbfaa05f778/tools/latent_scaler/scaler_training.py#L147-L149
+            l2_loss = torch.linalg.norm(error, dim=-1).mean()
 
             # L2 norm
             l2_norm_in = torch.norm(y, dim=-1)
@@ -304,7 +338,6 @@ class MidDecoder:
             per_token_l0 = (
                 (latent_acts != 0).float().sum(dim=-1).mean()
             )  # Shape: Scalar
-            # print("per_token_l0:", per_token_l0.item())
 
             # per "ctx_len" as a sequence in the batch
             latent_acts_reshaped = latent_acts.view(
@@ -346,8 +379,10 @@ class MidDecoder:
                 y_hat=y_hat,
                 latent_acts=self.latent_acts,
                 latent_indices=self.latent_indices,
-                fvu=fvu,
-                fve=fve,
+                explained_variance=explained_variance,
+                explained_variance_legacy=explained_variance_legacy,
+                unexplained_variance=unexplained_variance,
+                unexplained_variance_legacy=unexplained_variance_legacy,
                 is_last=is_last,
                 per_token_l0=per_token_l0,
                 per_sequence_l0=per_sequence_l0,
@@ -357,11 +392,12 @@ class MidDecoder:
                 per_sequence_l1=per_sequence_l1,
                 per_batch_l1=per_batch_l1,
                 per_feature_l1=per_feature_l1,
+                l2_loss=l2_loss,
+                l2_ratio=l2_ratio,
                 mse_loss=mse_loss,
                 norm_mse_loss=norm_mse_loss,
                 frac_dead=frac_dead,
                 cossim=cossim,
-                l2_ratio=l2_ratio,
                 relative_reconstruction_bias=relative_reconstruction_bias,
             )
 
