@@ -19,10 +19,16 @@ from transformers import (
     BitsAndBytesConfig,
     PreTrainedModel,
 )
+from torch.distributed.tensor import DTensor
+from transformers.models import gpt_oss
 
 from .data import MemmapDataset, chunk_and_tokenize
 from .trainer import TrainConfig, Trainer
 from .utils import DISTRIBUTE_MODEL
+
+# torch._dynamo.config.dynamic_shapes = True
+# torch._dynamo.config.capture_dynamic_output_shape_ops = True
+# torch._dynamo.config.suppress_errors = True
 
 # Suppress Pydantic warnings from simple_parsing's internal implementation
 warnings.filterwarnings(
@@ -33,6 +39,29 @@ warnings.filterwarnings(
     "ignore",
     message=".*'frozen' attribute.*has no effect in the context it was used.*",
 )
+
+original_apply_rotary_emb = gpt_oss.modeling_gpt_oss._apply_rotary_emb
+
+
+def _maybe_to_local(x):
+    if isinstance(x, DTensor):
+        return x.to_local(), x.device_mesh, x.placements
+    return x, None, None
+
+
+def patched_apply_rotary_emb(q, cos, sin):
+    q_local, q_mesh, q_places = _maybe_to_local(q)
+    cos_local, _, _ = _maybe_to_local(cos)
+    sin_local, _, _ = _maybe_to_local(sin)
+
+    out_local = original_apply_rotary_emb(q_local, cos_local, sin_local)
+
+    if q_mesh is not None:
+        return DTensor.from_local(out_local, q_mesh, q_places)
+    return out_local
+
+
+gpt_oss.modeling_gpt_oss._apply_rotary_emb = patched_apply_rotary_emb
 
 
 @dataclass
@@ -118,6 +147,7 @@ def load_artifacts(
         dtype=dtype,
         token=args.hf_token,
     )
+    model = torch.compile(model, mode="default", dynamic=True)
 
     if torch.distributed.is_initialized() and DISTRIBUTE_MODEL:
         # Force eager attention implementation to avoid DTensor issues
