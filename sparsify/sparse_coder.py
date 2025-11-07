@@ -394,17 +394,19 @@ class MidDecoder:
             per_feature_l1 = latent_acts.abs().sum(dim=0)  # Shape: (num_latents,)
 
             # fraction of dead latents
-            if self.dead_mask is not None:
-                num_dead = self.dead_mask.sum().item()
-                total_latents = self.dead_mask.numel()
-                frac_dead = num_dead / total_latents
-            else:
-                frac_dead = torch.tensor(0.0)
+            # if self.dead_mask is not None:
+            # num_dead = self.dead_mask.sum().item()
+            # total_latents = self.dead_mask.numel()
+            # frac_dead = num_dead / total_latents
+            # else:
+            # frac_dead = torch.tensor(0.0)
 
             assert len(latent_acts.shape) == 2, "latent_acts must be 2D"
             frac_alive = (
                 latent_acts.sum(dim=0) != 0
             ).float().sum() / latent_acts.shape[1]
+
+            frac_dead = 1.0 - frac_alive
 
             # Cross-entropy losses of language models (optional)
             loss_original = torch.tensor(0.0)
