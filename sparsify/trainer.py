@@ -534,6 +534,7 @@ class Trainer:
         avg_cossim = defaultdict(float)
         avg_relative_reconstruction_bias = defaultdict(float)
         avg_frac_alive = defaultdict(float)
+        avg_frac_dead = defaultdict(float)
         seen_tokens = 0
         fvu_losses = defaultdict(float)
         avg_ce = 0.0
@@ -909,6 +910,7 @@ class Trainer:
                     out.relative_reconstruction_bias / denom
                 )
                 avg_frac_alive[name] += float(out.frac_alive / denom)
+                avg_frac_dead[name] += float(out.frac_dead / denom)
 
                 prev_modules = [mod for mod in runner.outputs.keys() if mod != name]
                 prev_modules = [self.saes[mod] for mod in prev_modules]
@@ -1117,14 +1119,6 @@ class Trainer:
                         info["acc_top1"] = avg_acc_top1
 
                     for name in self.saes:
-                        mask = (
-                            self.num_tokens_since_fired[name]
-                            >= self.cfg.dead_feature_threshold
-                        )
-                        count = mask.sum().item()
-                        ratio = mask.mean(dtype=torch.float32).item()
-                        info.update({f"dead_feature_pct/{name}": ratio})
-                        info.update({f"dead_feature_count/{name}": count})
                         if "fvu" in self.cfg.loss_fn:
                             info[f"explained_variance/{name}"] = avg_explained_variance[
                                 name
@@ -1157,6 +1151,7 @@ class Trainer:
                             avg_relative_reconstruction_bias[name]
                         )
                         info[f"alive_feature_pct/{name}"] = avg_frac_alive[name]
+                        info[f"dead_feature_pct/{name}"] = avg_frac_dead[name]
 
                     if rank_zero:
                         info["train/k"] = self.get_current_k()
@@ -1201,6 +1196,7 @@ class Trainer:
                 avg_cossim.clear()
                 avg_relative_reconstruction_bias.clear()
                 avg_frac_alive.clear()
+                avg_frac_dead.clear()
                 avg_ce = 0.0
                 avg_kl = 0.0
                 avg_acc_top1 = 0.0
