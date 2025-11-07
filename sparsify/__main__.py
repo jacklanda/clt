@@ -30,6 +30,8 @@ from .utils import DISTRIBUTE_MODEL
 # torch._dynamo.config.capture_dynamic_output_shape_ops = True
 # torch._dynamo.config.suppress_errors = True
 
+torch.set_float32_matmul_precision('high')
+
 # Suppress Pydantic warnings from simple_parsing's internal implementation
 warnings.filterwarnings(
     "ignore",
@@ -147,9 +149,11 @@ def load_artifacts(
         dtype=dtype,
         token=args.hf_token,
     )
-    model = torch.compile(model, mode="default", dynamic=True)
 
-    if torch.distributed.is_initialized() and DISTRIBUTE_MODEL:
+    # Disable torch.compile when using DTensor to avoid FakeTensorMode conflicts
+    if not (torch.distributed.is_initialized() and DISTRIBUTE_MODEL):
+        model = torch.compile(model, mode="default", dynamic=True)
+    else:
         # Force eager attention implementation to avoid DTensor issues
         model.config._attn_implementation = "sdpa"
     model.config.use_cache = False

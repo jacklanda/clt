@@ -110,6 +110,7 @@ class Trainer:
 
         device = model.device
         with self.implicit_replication():
+            print("Resolving input and output widths")
             input_widths = resolve_widths(
                 model,
                 cfg.hookpoints,
@@ -169,7 +170,6 @@ class Trainer:
                     sae_cfg,
                     device,
                     mesh=mesh,
-                    # dtype=torch.float32,
                     dtype=torch.float16,
                     d_out=output_widths[hook],
                 )
@@ -418,9 +418,6 @@ class Trainer:
                 sae.cfg.k = k
 
     def fit(self):
-        # Use Tensor Cores even for fp32 matmuls
-        torch.set_float32_matmul_precision("high")
-
         # Make sure the model is frozen
         self.model.requires_grad_(False)
         self.model.eval()

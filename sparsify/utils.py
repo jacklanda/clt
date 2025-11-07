@@ -157,7 +157,9 @@ def resolve_widths(
             for k, v in model.dummy_inputs.items()
         }
         try:
-            model(**dummy)
+            # Disable torch.compile during shape inference to avoid FakeTensorMode conflicts with DTensor
+            # Use disable() as a decorator-style call instead of context manager
+            torch._dynamo.disable()(lambda: model(**dummy))()
         finally:
             for handle in handles:
                 handle.remove()
