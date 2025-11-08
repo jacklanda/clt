@@ -1069,7 +1069,7 @@ class Trainer:
 
             # Check if we need to actually do a training step
             step, substep = divmod(
-                self.global_step + 1, self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+                self.global_step, self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
             )
             if substep == 0:
                 if self.cfg.sae.normalize_decoder and not self.cfg.sae.transcode:
@@ -1258,8 +1258,6 @@ class Trainer:
 
     def _checkpoint(self, saes: dict[str, SparseCoder], path: str):
         """Save SAEs and training state to disk."""
-        print("Saving checkpoint")
-
         for optimizer in self.optimizers:
             if isinstance(optimizer, ScheduleFreeWrapperType):
                 optimizer.eval()

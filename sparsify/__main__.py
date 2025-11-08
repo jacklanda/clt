@@ -30,7 +30,7 @@ from .utils import DISTRIBUTE_MODEL
 # torch._dynamo.config.capture_dynamic_output_shape_ops = True
 # torch._dynamo.config.suppress_errors = True
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 
 # Suppress Pydantic warnings from simple_parsing's internal implementation
 warnings.filterwarnings(
