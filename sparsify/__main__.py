@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import transformers
 from datasets import Dataset, load_dataset
 from huggingface_hub import snapshot_download
 from simple_parsing import field, parse
@@ -25,10 +26,6 @@ from transformers.models import gpt_oss
 from .data import MemmapDataset, chunk_and_tokenize
 from .trainer import TrainConfig, Trainer
 from .utils import DISTRIBUTE_MODEL
-
-# torch._dynamo.config.dynamic_shapes = True
-# torch._dynamo.config.capture_dynamic_output_shape_ops = True
-# torch._dynamo.config.suppress_errors = True
 
 torch.set_float32_matmul_precision("high")
 
@@ -112,9 +109,7 @@ class RunConfig(TrainConfig):
     shuffle_seed: int = 42
     """Random seed for shuffling the dataset."""
 
-    data_preprocessing_num_proc: int = field(
-        default_factory=lambda: cpu_count(),
-    )
+    data_preprocessing_num_proc: int = 128
     """Number of processes to use for preprocessing data"""
 
 
@@ -128,13 +123,14 @@ def load_artifacts(
     else:
         dtype = "auto"
 
-    from liger_kernel.transformers import AutoLigerKernelForCausalLM
-
     # End-to-end training requires a model with a causal LM head
+    if args.loss_fn == "fvu":
+        load_causal_lm = False
+    else:
+        load_causal_lm = True
+
     model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
-    # if "olmoe" in args.model.lower():
-    # model_cls = AutoModel
-    # else:
+    # from liger_kernel.transformers import AutoLigerKernelForCausalLM
     # model_cls = AutoLigerKernelForCausalLM
 
     model = model_cls.from_pretrained(
@@ -151,11 +147,12 @@ def load_artifacts(
     )
 
     # Disable torch.compile when using DTensor to avoid FakeTensorMode conflicts
-    if not (torch.distributed.is_initialized() and DISTRIBUTE_MODEL):
-        model = torch.compile(model, mode="default", dynamic=True)
-    else:
-        # Force eager attention implementation to avoid DTensor issues
-        model.config._attn_implementation = "sdpa"
+    # if not (torch.distributed.is_initialized() and DISTRIBUTE_MODEL):
+    # model = torch.compile(model, mode="default", dynamic=True)
+    # else:
+    # Force eager attention implementation to avoid DTensor issues
+    model.config._attn_implementation = "sdpa"
+    # model.config._attn_implementation = "flash_attention_2"
     model.config.use_cache = False
 
     # For memmap-style datasets
@@ -241,12 +238,12 @@ def run():
     # Prevent ranks other than 0 from printing
     with nullcontext() if rank == 0 else redirect_stdout(None):
         # Awkward hack to prevent other ranks from duplicating data preprocessing
-        # if not distributed or rank == 0:
-        # model, dataset, tokenizer = load_artifacts(args, rank)
+        if not distributed or rank == 0:
+            model, dataset, tokenizer = load_artifacts(args, rank)
         if distributed:
             dist.barrier()
-            # if rank != 0:
-            model, dataset, tokenizer = load_artifacts(args, rank)
+            if rank != 0:
+                model, dataset, tokenizer = load_artifacts(args, rank)
             dist.barrier()
 
             if DISTRIBUTE_MODEL:
@@ -270,7 +267,6 @@ def run():
         print(f"Training on '{args.dataset}' (split '{args.split}')")
         print(f"Storing model weights in {model.dtype}")
 
-        # breakpoint()
         trainer = Trainer(args, dataset, model, tokenizer, mesh)
         if args.resume:
             trainer.load_state(f"checkpoints/{args.run_name}")
@@ -289,7 +285,6 @@ def run():
                         f"{args.finetune}/{name}",
                     )
 
-        # breakpoint()
         trainer.fit()
 
         if distributed:

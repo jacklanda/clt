@@ -69,7 +69,7 @@ class CrossLayerRunner(object):
                     **kwargs,
                 )
                 if hookpoint != module_name:
-                    output += out.sae_out
+                    output += out.y_hat
             else:
                 layer_mid.next()
 
@@ -87,7 +87,7 @@ class CrossLayerRunner(object):
                 add_post_enc=False,
                 no_extras=False,
                 denormalize=True,
-                addition=out.sae_out,
+                addition=out.y_hat,
                 **kwargs,
             )
 

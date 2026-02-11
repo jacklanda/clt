@@ -152,10 +152,7 @@ def resolve_widths(
         # 1. This is only inference to get shapes, not actual training
         # 2. The caller already wraps this in implicit_replication() context
         # 3. Some models (e.g., MoE) have operations incompatible with DTensor
-        dummy = {
-            k: v.to(model.device)
-            for k, v in model.dummy_inputs.items()
-        }
+        dummy = {k: v.to(model.device) for k, v in model.dummy_inputs.items()}
         try:
             # Disable torch.compile during shape inference to avoid FakeTensorMode conflicts with DTensor
             # Use disable() as a decorator-style call instead of context manager
@@ -207,7 +204,9 @@ def sharded_axis(
             sharding = tensor.placements
         except AttributeError:
             if verbose:
-                print(f"Warning: key {key} is not a DTensor, skipping sharded axis check.")
+                print(
+                    f"Warning: key {key} is not a DTensor, skipping sharded axis check."
+                )
             sharded_axes[key] = None
             continue
         assert isinstance(sharding[0], Replicate)
@@ -581,18 +580,17 @@ except ImportError:
     decoder_impl = eager_decode
     print("Triton not installed, using eager implementation of sparse decoder.")
 else:
-    if os.environ.get("SPARSIFY_DISABLE_TRITON") == "1":
+    if os.environ.get("DISABLE_TRITON") == "1":
         print("Triton disabled, using eager implementation of sparse decoder.")
         decoder_impl = eager_decode
     else:
         decoder_impl = triton_decode
 decoder_impl = parallelize_decoder(decoder_impl)
 
-USE_XFORMERS: bool = os.environ.get("SPARSIFY_USE_XFORMERS", "1") == "1"
+USE_XFORMERS: bool = os.environ.get("USE_XFORMERS", "1") == "1"
 
-DISTRIBUTE_MODEL: bool = os.environ.get("SPARSIFY_DISTRIBUTE_MODEL", "0") == "1"
+DISTRIBUTE_MODEL: bool = os.environ.get("DISTRIBUTE_MODEL", "0") == "1"
 if DISTRIBUTE_MODEL:
-
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
     sdpa_val = ALL_ATTENTION_FUNCTIONS["sdpa"]

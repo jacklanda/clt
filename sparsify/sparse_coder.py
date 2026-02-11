@@ -282,15 +282,15 @@ class MidDecoder:
             y_hat = self.sparse_coder.denormalize_output(y_hat)
 
         if no_extras:
-            raise NotImplementedError
             return ForwardOutput(
-                y_hat,
-                self.latent_acts,
-                self.latent_indices,
-                y_hat.new_tensor(0.0),
-                y_hat.new_tensor(0.0),
-                y_hat.new_tensor(0.0),
-                is_last,
+                y_hat=y_hat,
+                latent_acts=self.latent_acts,
+                latent_indices=self.latent_indices,
+                explained_variance=y_hat.new_tensor(0.0),
+                explained_variance_legacy=y_hat.new_tensor(0.0),
+                unexplained_variance=y_hat.new_tensor(0.0),
+                unexplained_variance_legacy=y_hat.new_tensor(0.0),
+                is_last=is_last,
             )
         else:
             # Compute the residual
@@ -893,6 +893,8 @@ class SparseCoder(nn.Module):
                         "d_out": self.d_out,
                     },
                     f,
+                    ensure_ascii=False,
+                    indent=4,
                 )
 
     @property

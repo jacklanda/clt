@@ -698,8 +698,6 @@ class Trainer:
                         # Ensure inputs is fully replicated before computing mean to get correct global mean
                         if isinstance(inputs, DTensor):
                             # Debug: print shapes
-                            import torch.distributed as dist
-
                             if dist.get_rank() == 0:
                                 print(
                                     f"Debug: inputs shape before redistribute: {inputs.shape}, placements: {inputs.placements}"
@@ -759,9 +757,13 @@ class Trainer:
                         outputs_replicated = outputs.redistribute(
                             self.mesh, [Replicate(), Replicate()]
                         )
-                        mean_local = outputs_replicated.to_local().mean(0).to(raw.dtype)
+                        # mean_local = outputs_replicated.to_local().mean(0).to(raw.dtype)
+                        mean_local = (
+                            outputs_replicated.to_local().float().mean(0).to(raw.dtype)
+                        )
                     else:
-                        mean_local = outputs.mean(0).to(raw.dtype)
+                        # mean_local = outputs.mean(0).to(raw.dtype)
+                        mean_local = outputs.float().mean(0).to(raw.dtype)
                     # Ensure mean is at least 1D
                     if mean_local.ndim == 0:
                         mean_local = mean_local.unsqueeze(0)
@@ -808,7 +810,8 @@ class Trainer:
 
                 if raw.cfg.normalize_io:
                     in_norm = inputs.norm(dim=-1).mean()
-                    out_norm = outputs.norm(dim=-1).mean()
+                    # out_norm = outputs.norm(dim=-1).mean()
+                    out_norm = outputs.float().norm(dim=-1).mean()
 
                     raw.in_norm.data[:] = in_norm
                     raw.out_norm.data[:] = out_norm
@@ -1069,7 +1072,7 @@ class Trainer:
 
             # Check if we need to actually do a training step
             step, substep = divmod(
-                self.global_step, self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+                self.global_step + 1, self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
             )
             if substep == 0:
                 if self.cfg.sae.normalize_decoder and not self.cfg.sae.transcode:

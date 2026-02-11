@@ -71,24 +71,14 @@ class GptOssExperts(nn.Module):
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim)
-        )
-        self.gate_up_proj_bias = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.expert_dim)
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty((self.num_experts, self.expert_dim, self.hidden_size))
-        )
-        self.down_proj_bias = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_size)
-        )
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim))
+        self.gate_up_proj_bias = nn.Parameter(torch.empty(self.num_experts, 2 * self.expert_dim))
+        self.down_proj = nn.Parameter(torch.empty((self.num_experts, self.expert_dim, self.hidden_size)))
+        self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
 
-    def forward(
-        self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         """
         When training it is more efficient to just loop over the experts and compute the output for each expert
         as otherwise the memory would explode.
@@ -103,18 +93,12 @@ class GptOssExperts(nn.Module):
             torch.Tensor
         """
         batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(
-            -1, self.hidden_size
-        )  # (num_tokens, hidden_size)
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
         num_experts = routing_weights.shape[1]
         if hidden_states.device.type == "cpu" or self.training:
-            next_states = torch.zeros_like(
-                hidden_states, dtype=hidden_states.dtype, device=hidden_states.device
-            )
+            next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
             with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(
-                    router_indices, num_classes=num_experts
-                )
+                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
                 expert_mask = expert_mask.permute(2, 1, 0)
                 # we sum on the top_k and on the sequence length to get which experts
                 # are hit this time around
@@ -125,46 +109,28 @@ class GptOssExperts(nn.Module):
                 with torch.no_grad():
                     _, token_idx = torch.where(expert_mask[expert_idx])
                 current_state = hidden_states[token_idx]
-                gate_up = (
-                    current_state @ self.gate_up_proj[expert_idx]
-                    + self.gate_up_proj_bias[expert_idx]
-                )
+                gate_up = current_state @ self.gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
                 gate, up = gate_up[..., ::2], gate_up[..., 1::2]
                 gate = gate.clamp(min=None, max=self.limit)
                 up = up.clamp(min=-self.limit, max=self.limit)
                 glu = gate * torch.sigmoid(gate * self.alpha)
                 gated_output = (up + 1) * glu
-                out = (
-                    gated_output @ self.down_proj[expert_idx]
-                    + self.down_proj_bias[expert_idx]
-                )
+                out = gated_output @ self.down_proj[expert_idx] + self.down_proj_bias[expert_idx]
                 weighted_output = out * routing_weights[token_idx, expert_idx, None]
-                next_states.index_add_(
-                    0, token_idx, weighted_output.to(hidden_states.dtype)
-                )
+                next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
             next_states = next_states.view(batch_size, -1, self.hidden_size)
         else:
             hidden_states = hidden_states.repeat(num_experts, 1)
             hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)
-            gate_up = (
-                torch.bmm(hidden_states, self.gate_up_proj)
-                + self.gate_up_proj_bias[..., None, :]
-            )
+            gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]
             gate, up = gate_up[..., ::2], gate_up[..., 1::2]
             gate = gate.clamp(min=None, max=self.limit)
             up = up.clamp(min=-self.limit, max=self.limit)
             glu = gate * torch.sigmoid(gate * self.alpha)
             next_states = torch.bmm(((up + 1) * glu), self.down_proj)
             next_states = next_states + self.down_proj_bias[..., None, :]
-            next_states = next_states.view(
-                num_experts, batch_size, -1, self.hidden_size
-            )
-            next_states = (
-                next_states
-                * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[
-                    ..., None
-                ]
-            )
+            next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)
+            next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
             next_states = next_states.sum(dim=0)
         return next_states
 
@@ -180,18 +146,10 @@ class GptOssTopKRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(
-            hidden_states, self.weight, self.bias
-        )  # (seq_len, num_experts)
-        router_top_value, router_indices = torch.topk(
-            router_logits, self.top_k, dim=-1
-        )  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(
-            router_top_value, dim=1, dtype=router_top_value.dtype
-        )
-        router_scores = torch.zeros_like(router_logits).scatter_(
-            1, router_indices, router_top_value
-        )
+        router_logits = F.linear(hidden_states, self.weight, self.bias)  # (seq_len, num_experts)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
         return router_scores, router_indices
 
 
@@ -203,12 +161,8 @@ class GptOssMLP(nn.Module):
         self.experts = GptOssExperts(config)
 
     def forward(self, hidden_states):
-        router_scores, router_indices = self.router(
-            hidden_states
-        )  # (num_experts, seq_len)
-        routed_out = self.experts(
-            hidden_states, router_indices=router_indices, routing_weights=router_scores
-        )
+        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
+        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
         return routed_out, router_scores
 
 
@@ -219,9 +173,7 @@ class GptOssRotaryEmbedding(nn.Module):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
-            )
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -237,23 +189,12 @@ class GptOssRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None]
-            .float()
-            .expand(position_ids.shape[0], -1, 1)
-            .to(x.device)
-        )
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
-        device_type = (
-            x.device.type
-            if isinstance(x.device.type, str) and x.device.type != "mps"
-            else "cpu"
-        )
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (
-                inv_freq_expanded.float() @ position_ids_expanded.float()
-            ).transpose(1, 2)
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = freqs
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -269,9 +210,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -311,9 +250,7 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    sinks = module.sinks.reshape(1, -1, 1, 1).expand(
-        query.shape[0], -1, query.shape[-2], -1
-    )
+    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
 
     # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
@@ -335,40 +272,24 @@ class GptOssAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.q_proj = nn.Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=config.attention_bias,
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
         self.k_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
         self.v_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.sliding_window = (
-            config.sliding_window
-            if config.layer_types[layer_idx] == "sliding_attention"
-            else None
-        )
+        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
         self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -389,21 +310,15 @@ class GptOssAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
-        )
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -429,12 +344,8 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = GptOssAttention(config=config, layer_idx=layer_idx)
         self.mlp = GptOssMLP(config)
-        self.input_layernorm = GptOssRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = GptOssRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -446,9 +357,7 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -531,14 +440,9 @@ class GptOssModel(GptOssPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [
-                GptOssDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [GptOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = GptOssRotaryEmbedding(config=config)
@@ -561,9 +465,7 @@ class GptOssModel(GptOssPreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -572,13 +474,9 @@ class GptOssModel(GptOssPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
-            past_seen_tokens = (
-                past_key_values.get_seq_length() if past_key_values is not None else 0
-            )
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
@@ -652,9 +550,7 @@ def load_balancing_loss_func(
 
     if isinstance(gate_logits, tuple):
         compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat(
-            [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
-        )
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
@@ -670,24 +566,20 @@ def load_balancing_loss_func(
         router_prob_per_expert = torch.mean(routing_weights, dim=0)
     else:
         batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (
-            batch_size * sequence_length
-        )
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
 
         # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
         expert_attention_mask = (
             attention_mask[None, :, :, None, None]
-            .expand(
-                (num_hidden_layers, batch_size, sequence_length, top_k, num_experts)
-            )
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
             .reshape(-1, top_k, num_experts)
             .to(compute_device)
         )
 
         # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(
-            expert_mask.float() * expert_attention_mask, dim=0
-        ) / torch.sum(expert_attention_mask, dim=0)
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
 
         # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
         router_per_expert_attention_mask = (
@@ -698,9 +590,9 @@ def load_balancing_loss_func(
         )
 
         # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(
-            routing_weights * router_per_expert_attention_mask, dim=0
-        ) / torch.sum(router_per_expert_attention_mask, dim=0)
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
@@ -764,9 +656,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         ```"""
 
         output_router_logits = (
-            output_router_logits
-            if output_router_logits is not None
-            else self.config.output_router_logits
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
@@ -784,11 +674,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
 
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = (
-            slice(-logits_to_keep, None)
-            if isinstance(logits_to_keep, int)
-            else logits_to_keep
-        )
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
@@ -804,9 +690,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
                 attention_mask,
             )
             if labels is not None:
-                loss += self.router_aux_loss_coef * aux_loss.to(
-                    loss.device
-                )  # make sure to reside in the same device
+                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
         return MoeCausalLMOutputWithPast(
             loss=loss,
@@ -819,15 +703,11 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         )
 
 
-class GptOssForSequenceClassification(
-    GenericForSequenceClassification, GptOssPreTrainedModel
-):
+class GptOssForSequenceClassification(GenericForSequenceClassification, GptOssPreTrainedModel):
     pass
 
 
-class GptOssForTokenClassification(
-    GenericForTokenClassification, GptOssPreTrainedModel
-):
+class GptOssForTokenClassification(GenericForTokenClassification, GptOssPreTrainedModel):
     pass
 
 
