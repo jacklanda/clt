@@ -24,6 +24,7 @@ from torch.distributed.tensor import DTensor
 from transformers.models import gpt_oss
 
 from .data import MemmapDataset, chunk_and_tokenize
+from .activation_store import cache_activations, CachedActivationDataset
 from .trainer import TrainConfig, Trainer
 from .utils import DISTRIBUTE_MODEL
 
@@ -207,8 +208,6 @@ def run():
 
     if distributed:
         torch.cuda.set_device(rank)
-        # Increase the default timeout in order to account for slow downloads
-        # and data preprocessing on the main rank
         dist.init_process_group(
             "cpu:gloo,cuda:nccl",
             device_id=torch.device(rank),
@@ -235,9 +234,52 @@ def run():
         mesh = None
         dp_rank = 0
 
-    # Prevent ranks other than 0 from printing
+    # ── Cached training path ──
+    if args.use_cached and args.cache_dir:
+        with nullcontext() if rank == 0 else redirect_stdout(None):
+            _run_cached(args, rank, distributed, mesh, dp_rank)
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
+
+    # ── Phase 1: Cache activations if cache_dir is set but cache doesn't exist ──
+    if args.cache_dir and not os.path.exists(os.path.join(args.cache_dir, "metadata.json")):
+        with nullcontext() if rank == 0 else redirect_stdout(None):
+            if rank == 0:
+                print(f"Phase 1: Caching activations to {args.cache_dir}")
+                model, dataset, tokenizer = load_artifacts(args, rank)
+                cache_activations(
+                    model=model,
+                    dataset=dataset,
+                    hookpoint_patterns=args.hookpoints,
+                    layers=args.layers,
+                    layer_stride=args.layer_stride,
+                    save_dir=args.cache_dir,
+                    batch_size=args.batch_size,
+                    ctx_len=args.ctx_len,
+                    transcode=args.sae.transcode,
+                    filter_bos=args.filter_bos,
+                    remove_first_token=args.remove_first_token,
+                    max_examples=args.max_examples,
+                )
+                del model
+                torch.cuda.empty_cache()
+                print("Phase 1 complete. Model deleted, GPU memory freed.")
+
+        if distributed:
+            dist.barrier()
+
+        # Now run Phase 2 with cached activations
+        with nullcontext() if rank == 0 else redirect_stdout(None):
+            _run_cached(args, rank, distributed, mesh, dp_rank)
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
+
+    # ── Original (non-cached) training path ──
     with nullcontext() if rank == 0 else redirect_stdout(None):
-        # Awkward hack to prevent other ranks from duplicating data preprocessing
         if not distributed or rank == 0:
             model, dataset, tokenizer = load_artifacts(args, rank)
         if distributed:
@@ -252,15 +294,12 @@ def run():
                     mesh,
                 )
 
-            # cache on all processes separately if the model is not distributed
             example_world_size = mesh.shape[0] if DISTRIBUTE_MODEL else world_size
-            # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % example_world_size
             dataset = dataset.select(range(len(dataset) - remainder_examples))
 
             dataset = dataset.shard(example_world_size, dp_rank)
 
-            # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % example_world_size
             dataset = dataset.select(range(len(dataset) - remainder_examples))
 
@@ -290,6 +329,73 @@ def run():
         if distributed:
             dist.barrier()
             dist.destroy_process_group()
+
+
+def _run_cached(args: RunConfig, rank: int, distributed: bool,
+                mesh, dp_rank: int):
+    """Phase 2: Train SAEs from cached activations without loading the base model."""
+    print(f"Phase 2: Training from cached activations at {args.cache_dir}")
+
+    cached_dataset = CachedActivationDataset(
+        args.cache_dir, args.ctx_len, args.max_examples
+    )
+
+    if distributed:
+        world_size = dist.get_world_size()
+        example_world_size = mesh.shape[0] if DISTRIBUTE_MODEL else world_size
+        remainder = len(cached_dataset) % example_world_size
+        if remainder > 0:
+            cached_dataset = cached_dataset.select(
+                range(len(cached_dataset) - remainder)
+            )
+        cached_dataset = cached_dataset.shard(example_world_size, dp_rank)
+
+    # We still need a model to initialize the Trainer (for hookpoint resolution
+    # and width detection). Load it temporarily on CPU to avoid GPU memory usage,
+    # then build the trainer with a minimal model reference.
+    # However, the Trainer.__init__ needs model on GPU for resolve_widths.
+    # Instead, we load the model, init the trainer, then delete the model.
+    from transformers import AutoModel, AutoModelForCausalLM
+
+    model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
+    model = model_cls.from_pretrained(
+        args.model,
+        device_map={"": f"cuda:{rank}"},
+        revision=args.revision,
+        dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else "auto",
+        token=args.hf_token,
+    )
+    model.config._attn_implementation = "sdpa"
+    model.config.use_cache = False
+
+    if distributed and DISTRIBUTE_MODEL:
+        from torch.distributed.tensor import distribute_module
+        model = distribute_module(model, mesh)
+
+    # Use the cached dataset's hookpoints to override config
+    args.hookpoints = cached_dataset.hookpoints
+
+    trainer = Trainer(args, cached_dataset, model, None, mesh)
+
+    # Free the base model from GPU
+    del model
+    torch.cuda.empty_cache()
+    print("Base model deleted — GPU memory freed for SAE training")
+
+    if args.resume:
+        trainer.load_state(f"checkpoints/{args.run_name}")
+    elif args.finetune:
+        for name, sae in trainer.saes.items():
+            if not os.path.exists(f"{args.finetune}/{name}"):
+                repo_path = snapshot_download(
+                    args.finetune,
+                    allow_patterns=f"{name}/*",
+                )
+                sae.load_state(Path(repo_path) / name)
+            else:
+                sae.load_state(f"{args.finetune}/{name}")
+
+    trainer.fit_cached(cached_dataset)
 
 
 if __name__ == "__main__":

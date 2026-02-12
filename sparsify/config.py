@@ -134,6 +134,10 @@ class TrainConfig(Serializable):
     remove_first_token: bool = False
     """Remove the first token from each sequence."""
 
+    post_softmax: bool = True
+    """Apply softmax to module outputs before using them as the transcoder target.
+    Useful for MoE gate hookpoints where outputs are raw logits."""
+
     remove_transcoded_modules: bool = False
     """Don't run modules that are replaced for transcoders with CE loss."""
 
@@ -222,6 +226,12 @@ class TrainConfig(Serializable):
 
     save_dir: str = "checkpoints"
 
+    cache_dir: str | None = None
+    """Directory for cached activations. If set, activations will be cached/loaded here."""
+
+    use_cached: bool = False
+    """Use cached activations instead of running the base model forward pass."""
+
     def __post_init__(self):
         """Validate the configuration."""
         if self.layers and self.layer_stride != 1:
@@ -229,3 +239,6 @@ class TrainConfig(Serializable):
 
         if not self.init_seeds:
             raise ValueError("Must specify at least one random seed.")
+
+        if self.use_cached and not self.cache_dir:
+            raise ValueError("`cache_dir` must be set when `use_cached` is True.")

@@ -25,6 +25,7 @@ from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
 
 from .config import TrainConfig
 from .data import MemmapDataset
+from .activation_store import CachedActivationDataset
 from .fused_encoder import DeadLatentLoss
 
 # from .nanogpt import Muon
@@ -617,6 +618,19 @@ class Trainer:
                     inputs = inputs.flatten(0, 1)
             else:
                 inputs = outputs
+
+            # Apply softmax BEFORE DTensor redistribution (softmax needs full feature dim)
+            if self.cfg.post_softmax and self.cfg.sae.transcode:
+                if isinstance(outputs, DTensor):
+                    outputs = outputs.redistribute(
+                        self.mesh, [Replicate(), Replicate()]
+                    ).to_local()
+                    outputs = outputs.softmax(dim=-1)
+                    outputs = DTensor.from_local(
+                        outputs, self.mesh, [Replicate(), Replicate()]
+                    )
+                else:
+                    outputs = outputs.softmax(dim=-1)
 
             if self.mesh is not None:
                 # If tensors are already DTensors from distributed model, convert to local first
@@ -1215,6 +1229,429 @@ class Trainer:
             self.save_best(avg_losses)
 
         pbar.close()
+
+    def fit_cached(self, cached_dataset: CachedActivationDataset):
+        """Train SAEs from cached activations without base model forward passes.
+
+        This is the Phase 2 training loop. Activations are loaded from disk
+        (memmap, zero-copy) so the base model does not need to be in GPU memory.
+        Only supports loss_fn='fvu' since we don't have model logits.
+        """
+        assert self.cfg.loss_fn == "fvu", (
+            "Cached training only supports loss_fn='fvu'. "
+            f"Got '{self.cfg.loss_fn}'."
+        )
+
+        rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+        device = next(iter(self.saes.values())).device
+
+        wandb = None
+        if self.cfg.log_to_wandb and rank_zero:
+            try:
+                import wandb
+
+                if self.cfg.resume and self.cfg.run_id is not None:
+                    wandb.init(
+                        name=self.cfg.run_name,
+                        project=os.getenv("WANDB_PROJECT", "sparsify"),
+                        entity=os.getenv("WANDB_ENTITY", None),
+                        id=self.cfg.run_id,
+                        resume="allow",
+                        config=asdict(self.cfg),
+                        save_code=True,
+                    )
+                else:
+                    wandb.init(
+                        name=self.cfg.run_name,
+                        project=os.getenv("WANDB_PROJECT", "sparsify"),
+                        entity=os.getenv("WANDB_ENTITY", None),
+                        config=asdict(self.cfg),
+                        save_code=True,
+                    )
+            except (AttributeError, ImportError):
+                self.cfg.log_to_wandb = False
+
+        num_sae_params = sum(
+            p.numel() for s in self.saes.values() for p in s.parameters()
+        )
+        global_batch_size = (
+            self.cfg.batch_size
+            * self.cfg.ctx_len
+            * self.cfg.grad_acc_steps
+            * self.cfg.micro_acc_steps
+        )
+        print(f"[Cached] Global batch size: {global_batch_size:_}")
+        print(f"[Cached] Number of CLT parameters: {num_sae_params:_}")
+        print(f"[Cached] Base model NOT loaded — all GPU memory for SAEs")
+
+        num_batches = len(cached_dataset) // (
+            self.cfg.batch_size * self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+        )
+
+        if self.global_step > 0:
+            n = (
+                self.global_step
+                * self.cfg.batch_size
+                * self.cfg.grad_acc_steps
+                * self.cfg.micro_acc_steps
+            )
+            ds = cached_dataset.select(range(n, len(cached_dataset)))
+        else:
+            ds = cached_dataset
+
+        dl = DataLoader(
+            ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=4,
+            prefetch_factor=2,
+        )
+
+        # GradScaler for float16 stability
+        use_scaler = any(
+            p.dtype == torch.float16
+            for sae in self.saes.values()
+            for p in sae.parameters()
+        )
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+
+        pbar = tqdm(
+            desc="Training (cached)",
+            disable=not rank_zero,
+            initial=self.global_step,
+            total=num_batches,
+            leave=False,
+        )
+
+        did_fire = {
+            name: torch.zeros(sae.num_latents, device=device, dtype=torch.bool)
+            for name, sae in self.saes.items()
+        }
+
+        acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+        denom = acc_steps * self.cfg.wandb_log_frequency
+        num_tokens_in_step = 0
+
+        # Logging accumulators
+        avg_explained_variance = defaultdict(float)
+        avg_explained_variance_legacy = defaultdict(float)
+        avg_unexplained_variance = defaultdict(float)
+        avg_unexplained_variance_legacy = defaultdict(float)
+        avg_per_token_l0 = defaultdict(float)
+        avg_per_sequence_l0 = defaultdict(float)
+        avg_per_batch_l0 = defaultdict(float)
+        avg_per_feature_l0 = defaultdict(float)
+        avg_per_token_l1 = defaultdict(float)
+        avg_per_sequence_l1 = defaultdict(float)
+        avg_per_batch_l1 = defaultdict(float)
+        avg_per_feature_l1 = defaultdict(float)
+        avg_mse_loss = defaultdict(float)
+        avg_norm_mse_loss = defaultdict(float)
+        avg_l2_loss = defaultdict(float)
+        avg_l2_ratio = defaultdict(float)
+        avg_cossim = defaultdict(float)
+        avg_relative_reconstruction_bias = defaultdict(float)
+        avg_frac_alive = defaultdict(float)
+        avg_frac_dead = defaultdict(float)
+        seen_tokens = 0
+        avg_losses = {name: float("inf") for name in self.cfg.hookpoints}
+
+        runner = CrossLayerRunner()
+        first_batch = True
+
+        for batch in dl:
+            # batch["inputs"] and batch["outputs"] are dicts: hookpoint -> [B, ctx_len, d]
+            # batch["bos_mask"] is [B, ctx_len]
+            bos_mask = batch["bos_mask"].to(device)
+            bos_mask_flat = bos_mask.flatten(0, 1)
+
+            runner.reset()
+            num_tokens_in_step += bos_mask.numel()
+
+            for name in self.cfg.hookpoints:
+                inputs = batch["inputs"][name].to(device).flatten(0, 1)
+                outputs = batch["outputs"][name].to(device).flatten(0, 1)
+
+                # Apply softmax BEFORE DTensor conversion (needs full feature dim)
+                if self.cfg.post_softmax and self.cfg.sae.transcode:
+                    outputs = outputs.softmax(dim=-1)
+
+                if self.mesh is not None:
+                    inputs = DTensor.from_local(
+                        inputs, self.mesh, [Replicate(), Replicate()]
+                    ).redistribute(self.mesh, [Shard(0), Replicate()])
+                    outputs = DTensor.from_local(
+                        outputs, self.mesh, [Replicate(), Replicate()]
+                    ).redistribute(self.mesh, [Shard(0), Shard(1)])
+                    bos_mask_mesh = DTensor.from_local(
+                        bos_mask_flat, self.mesh, [Replicate(), Replicate()]
+                    ).redistribute(self.mesh, [Shard(0), Replicate()])
+                else:
+                    bos_mask_mesh = bos_mask_flat
+
+                raw = self.saes[name]
+
+                # Initialize biases on first batch
+                if first_batch and self.global_step == 0 and not self.cfg.finetune:
+                    self._init_biases_cached(raw, inputs, outputs, name)
+
+                if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
+                    raw.set_decoder_norm_to_unit_norm()
+
+                encoding = runner.encode(
+                    inputs,
+                    sparse_coder=raw,
+                    dead_mask=self.num_tokens_since_fired[name]
+                    >= self.cfg.dead_feature_threshold,
+                )
+                out = runner.decode(
+                    encoding,
+                    outputs,
+                    module_name=name,
+                    detach_grad=True,
+                    loss_mask=(~bos_mask_mesh),
+                )
+
+                assert isinstance(out, ForwardOutput)
+
+                # Update did_fire
+                latent_indices = encoding.latent_indices.flatten()
+                if isinstance(latent_indices, DTensor):
+                    latent_indices = latent_indices.to_local()
+                did_fire[name][latent_indices] = True
+                self.maybe_all_reduce(did_fire[name], "max")
+
+                # Accumulate metrics
+                avg_explained_variance[name] += float(
+                    out.explained_variance.detach() / denom
+                )
+                avg_explained_variance_legacy[name] += float(
+                    out.explained_variance_legacy.detach() / denom
+                )
+                avg_unexplained_variance[name] += float(
+                    out.unexplained_variance.detach() / denom
+                )
+                avg_unexplained_variance_legacy[name] += float(
+                    out.unexplained_variance_legacy.detach() / denom
+                )
+                avg_per_token_l0[name] += float(out.per_token_l0 / denom)
+                avg_per_sequence_l0[name] += float(out.per_sequence_l0 / denom)
+                avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / denom)
+                avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / denom)
+                avg_per_token_l1[name] += float(out.per_token_l1 / denom)
+                avg_per_sequence_l1[name] += float(out.per_sequence_l1 / denom)
+                avg_per_batch_l1[name] += float(out.per_batch_l1.sum() / denom)
+                avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / denom)
+                avg_mse_loss[name] += float(out.mse_loss / denom)
+                avg_norm_mse_loss[name] += float(out.norm_mse_loss / denom)
+                avg_l2_loss[name] += float(out.l2_loss / denom)
+                avg_l2_ratio[name] += float(out.l2_ratio / denom)
+                avg_cossim[name] += float(out.cossim / denom)
+                avg_relative_reconstruction_bias[name] += float(
+                    out.relative_reconstruction_bias / denom
+                )
+                avg_frac_alive[name] += float(out.frac_alive / denom)
+                avg_frac_dead[name] += float(out.frac_dead / denom)
+
+                loss = out.unexplained_variance / acc_steps
+                scaler.scale(loss).backward()
+                del loss
+
+                runner.restore()
+
+            first_batch = False
+
+            # Check if we need to do a training step
+            step, substep = divmod(
+                self.global_step + 1, self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+            )
+            if substep == 0:
+                if self.cfg.sae.normalize_decoder and not self.cfg.sae.transcode:
+                    for sae in self.saes.values():
+                        sae.remove_gradient_parallel_to_decoder_directions()
+
+                for optimizer in self.optimizers:
+                    scaler.step(optimizer)
+                    optimizer.zero_grad()
+                scaler.update()
+
+                for scheduler in self.lr_schedulers:
+                    scheduler.step()
+
+                self.set_correct_k()
+
+                with torch.no_grad():
+                    for name, counts in self.num_tokens_since_fired.items():
+                        counts += num_tokens_in_step
+                        counts[did_fire[name]] = 0
+                    num_tokens_in_step = 0
+                    for mask in did_fire.values():
+                        mask.zero_()
+
+                if (step + 1) % self.cfg.save_every == 0:
+                    print(f"Saving checkpoint at step {step + 1}")
+                    self.save()
+                    if self.cfg.save_best:
+                        self.save_best(avg_losses)
+
+                if (
+                    self.cfg.log_to_wandb
+                    and (step + 1) % self.cfg.wandb_log_frequency == 0
+                ):
+                    info = {}
+                    for name in self.saes:
+                        info[f"explained_variance/{name}"] = avg_explained_variance[name]
+                        info[f"explained_variance_legacy/{name}"] = (
+                            avg_explained_variance_legacy[name]
+                        )
+                        info[f"unexplained_variance/{name}"] = (
+                            avg_unexplained_variance[name]
+                        )
+                        info[f"unexplained_variance_legacy/{name}"] = (
+                            avg_unexplained_variance_legacy[name]
+                        )
+                        info[f"mse/{name}"] = avg_mse_loss[name]
+                        info[f"norm_mse/{name}"] = avg_norm_mse_loss[name]
+                        info[f"l0(per_token)/{name}"] = avg_per_token_l0[name]
+                        info[f"l0(per_sequence)/{name}"] = avg_per_sequence_l0[name]
+                        info[f"l0(per_batch)/{name}"] = avg_per_batch_l0[name]
+                        info[f"l0(per_feature)/{name}"] = avg_per_feature_l0[name]
+                        info[f"l1(per_token)/{name}"] = avg_per_token_l1[name]
+                        info[f"l1(per_sequence)/{name}"] = avg_per_sequence_l1[name]
+                        info[f"l1(per_batch)/{name}"] = avg_per_batch_l1[name]
+                        info[f"l1(per_feature)/{name}"] = avg_per_feature_l1[name]
+                        info[f"l2/{name}"] = avg_l2_loss[name]
+                        info[f"l2_ratio/{name}"] = avg_l2_ratio[name]
+                        info[f"cossim/{name}"] = avg_cossim[name]
+                        info[f"relative_reconstruction_bias/{name}"] = (
+                            avg_relative_reconstruction_bias[name]
+                        )
+                        info[f"alive_feature_pct/{name}"] = avg_frac_alive[name]
+                        info[f"dead_feature_pct/{name}"] = avg_frac_dead[name]
+
+                    if rank_zero:
+                        info["train/k"] = self.get_current_k()
+                        info["train/lr"] = self.optimizers[0].param_groups[0]["lr"]
+                        info["train/global_step"] = step
+                        info["train/seen_tokens"] = seen_tokens = (
+                            seen_tokens
+                            + self.cfg.batch_size
+                            * self.cfg.ctx_len
+                            * self.cfg.grad_acc_steps
+                            * self.cfg.micro_acc_steps
+                        )
+                        for name in self.cfg.hookpoints:
+                            info[f"loss/{name}"] = avg_unexplained_variance.get(
+                                name, float("inf")
+                            )
+
+                        if wandb is not None:
+                            wandb.log(info, step=step)
+
+                    avg_explained_variance.clear()
+                    avg_explained_variance_legacy.clear()
+                    avg_unexplained_variance.clear()
+                    avg_unexplained_variance_legacy.clear()
+                    avg_per_token_l0.clear()
+                    avg_per_sequence_l0.clear()
+                    avg_per_batch_l0.clear()
+                    avg_per_feature_l0.clear()
+                    avg_per_token_l1.clear()
+                    avg_per_sequence_l1.clear()
+                    avg_per_batch_l1.clear()
+                    avg_per_feature_l1.clear()
+                    avg_mse_loss.clear()
+                    avg_norm_mse_loss.clear()
+                    avg_l2_loss.clear()
+                    avg_l2_ratio.clear()
+                    avg_cossim.clear()
+                    avg_relative_reconstruction_bias.clear()
+                    avg_frac_alive.clear()
+                    avg_frac_dead.clear()
+
+                    pbar.update()
+                    self.update_step += 1
+
+            self.global_step += 1
+            if self.global_step >= self.cfg.max_steps:
+                print("Early stop with reaching maximum training steps.")
+                break
+
+        self.save()
+        if self.cfg.save_best:
+            self.save_best(avg_losses)
+        pbar.close()
+
+    def _init_biases_cached(self, raw: SparseCoder, inputs: Tensor,
+                            outputs: Tensor, name: str):
+        """Initialize encoder/decoder biases from the first batch of cached activations."""
+        if self.cfg.sae.transcode:
+            if isinstance(inputs, DTensor):
+                inputs_local = inputs.redistribute(
+                    self.mesh, [Replicate(), Replicate()]
+                ).to_local()
+            else:
+                inputs_local = inputs
+            mean = -inputs_local.mean(0).to(raw.dtype)
+
+            weight = raw.encoder.weight.data
+            bias = raw.encoder.bias.data * 0
+            if isinstance(weight, DTensor):
+                weight = weight.redistribute(
+                    self.mesh, [Replicate(), Replicate()]
+                ).to_local()
+            if isinstance(bias, DTensor):
+                if self.mesh.ndim == 2:
+                    bias = bias.redistribute(
+                        self.mesh, [Replicate(), Replicate()]
+                    ).to_local()
+                else:
+                    bias = bias.redistribute(
+                        self.mesh, [Replicate()]
+                    ).to_local()
+
+            mean_image = torch.nn.functional.linear(mean, weight, bias)
+            if isinstance(raw.encoder.bias.data, DTensor):
+                mean_image = DTensor.from_local(
+                    mean_image, self.mesh, [Replicate(), Replicate()]
+                ).redistribute(self.mesh, raw.encoder.bias.data.placements)
+            raw.encoder.bias.data[:] = mean_image
+
+        # Initialize decoder bias
+        if isinstance(outputs, DTensor):
+            outputs_local = outputs.redistribute(
+                self.mesh, [Replicate(), Replicate()]
+            ).to_local()
+            mean = outputs_local.float().mean(0).to(raw.dtype)
+        else:
+            mean = outputs.float().mean(0).to(raw.dtype)
+
+        if not hasattr(raw, "b_decs"):
+            if isinstance(raw.b_dec.data, DTensor) and not isinstance(mean, DTensor):
+                mean = DTensor.from_local(
+                    mean, self.mesh, [Replicate(), Replicate()]
+                ).redistribute(self.mesh, raw.b_dec.data.placements)
+            raw.b_dec.data[:] = mean
+        else:
+            if isinstance(raw.b_decs[0].data, DTensor) and not isinstance(mean, DTensor):
+                mean = DTensor.from_local(
+                    mean, self.mesh, [Replicate(), Replicate()]
+                ).redistribute(self.mesh, raw.b_decs[0].data.placements)
+            raw.b_decs[0].data[:] = mean
+
+        if raw.cfg.normalize_io:
+            in_norm = inputs.norm(dim=-1).mean()
+            out_norm = outputs.float().norm(dim=-1).mean()
+            raw.in_norm.data[:] = in_norm
+            raw.out_norm.data[:] = out_norm
+            for b_dec in raw.b_decs if hasattr(raw, "b_decs") else [raw.b_dec]:
+                b_dec.data[:] = b_dec.data * (
+                    (b_dec.shape[-1] ** 0.5) / out_norm
+                )
+            raw.encoder.bias.data[:] = raw.encoder.bias.data * (
+                (raw.encoder.weight.shape[-1] ** 0.5) / in_norm
+            )
 
     def input_ids_to_mesh(self, x: Tensor) -> Tensor:
         if self.mesh is not None and DISTRIBUTE_MODEL:
