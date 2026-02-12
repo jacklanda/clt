@@ -90,6 +90,12 @@ class SparseCoderConfig(Serializable):
     use_fp8: bool = False
     """Use FP8 for the sparse coder."""
 
+    encoder_tile_size: int = 0
+    """Tile size for memory-efficient tiled encoder. When > 0, the encoder
+    processes the weight matrix in tiles of this size to avoid materializing
+    the full [batch*seq, num_latents] preactivation tensor. Set to 0 to
+    auto-detect (tiles when num_latents > 8192), or -1 to disable."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig

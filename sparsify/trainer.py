@@ -511,6 +511,8 @@ class Trainer:
         acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
+        # Mutable flag: when False, MidDecoder skips expensive metrics
+        _compute_metrics = [True]
 
         # For logging purposes
         avg_explained_variance = defaultdict(float)
@@ -580,6 +582,10 @@ class Trainer:
             cached_outputs[module_to_name[module]] = outputs
 
         def hook(module: nn.Module, inputs, outputs, force_loss_fn=None):
+            with torch.enable_grad():  # re-enable grads even if called under no_grad()
+                return _hook_impl(module, inputs, outputs, force_loss_fn)
+
+        def _hook_impl(module: nn.Module, inputs, outputs, force_loss_fn=None):
             if force_loss_fn is not None:
                 loss_fn = force_loss_fn
             else:
@@ -633,25 +639,24 @@ class Trainer:
                     outputs = outputs.softmax(dim=-1)
 
             if self.mesh is not None:
-                # If tensors are already DTensors from distributed model, convert to local first
+                _rep_rep = (Replicate(), Replicate())
+                # If tensors are already DTensors from distributed model, ensure Replicate placement
                 if isinstance(inputs, DTensor):
-                    # Fully replicate and then convert to local
-                    inputs = inputs.redistribute(
-                        self.mesh, [Replicate(), Replicate()]
-                    ).to_local()
-                    # Re-create as DTensor with correct placements
-                    inputs = DTensor.from_local(
-                        inputs, self.mesh, [Replicate(), Replicate()]
-                    )
+                    if tuple(inputs.placements) != _rep_rep:
+                        inputs = inputs.redistribute(
+                            self.mesh, [Replicate(), Replicate()]
+                        ).to_local()
+                        inputs = DTensor.from_local(
+                            inputs, self.mesh, [Replicate(), Replicate()]
+                        )
                 if isinstance(outputs, DTensor):
-                    # Fully replicate and then convert to local
-                    outputs = outputs.redistribute(
-                        self.mesh, [Replicate(), Replicate()]
-                    ).to_local()
-                    # Re-create as DTensor with correct placements
-                    outputs = DTensor.from_local(
-                        outputs, self.mesh, [Replicate(), Replicate()]
-                    )
+                    if tuple(outputs.placements) != _rep_rep:
+                        outputs = outputs.redistribute(
+                            self.mesh, [Replicate(), Replicate()]
+                        ).to_local()
+                        outputs = DTensor.from_local(
+                            outputs, self.mesh, [Replicate(), Replicate()]
+                        )
 
                 if not DISTRIBUTE_MODEL:
                     # Convert local tensors to replicated DTensors
@@ -854,6 +859,7 @@ class Trainer:
                 detach_grad=loss_fn == "fvu",
                 loss_mask=(~bos_mask_mesh if loss_fn == "fvu" else None),
                 compute_nll_loss=self.cfg.compute_nll_loss,
+                compute_metrics=_compute_metrics[0],
                 texts=texts,
                 lm=self.lm,
                 submodule=name,
@@ -895,36 +901,41 @@ class Trainer:
                 # Replace the normal output with the SAE output
                 return (output, *aux_out) if aux_out is not None else output
             else:
-                avg_explained_variance[name] += float(
-                    out.explained_variance.detach() / denom
-                )
-                avg_explained_variance_legacy[name] += float(
-                    out.explained_variance_legacy.detach() / denom
-                )
+                # Always accumulate the loss (needed for training)
                 avg_unexplained_variance[name] += float(
                     out.unexplained_variance.detach() / denom
                 )
-                avg_unexplained_variance_legacy[name] += float(
-                    out.unexplained_variance_legacy.detach() / denom
-                )
-                avg_per_token_l0[name] += float(out.per_token_l0 / denom)
-                avg_per_sequence_l0[name] += float(out.per_sequence_l0 / denom)
-                avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / denom)
-                avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / denom)
-                avg_per_token_l1[name] += float(out.per_token_l1 / denom)
-                avg_per_sequence_l1[name] += float(out.per_sequence_l1 / denom)
-                avg_per_batch_l1[name] += float(out.per_batch_l1.sum() / denom)
-                avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / denom)
-                avg_mse_loss[name] += float(out.mse_loss / denom)
-                avg_norm_mse_loss[name] += float(out.norm_mse_loss / denom)
-                avg_l2_loss[name] += float(out.l2_loss / denom)
-                avg_l2_ratio[name] += float(out.l2_ratio / denom)
-                avg_cossim[name] += float(out.cossim / denom)
-                avg_relative_reconstruction_bias[name] += float(
-                    out.relative_reconstruction_bias / denom
-                )
-                avg_frac_alive[name] += float(out.frac_alive / denom)
-                avg_frac_dead[name] += float(out.frac_dead / denom)
+
+                # Only accumulate expensive metrics when they were computed
+                if _compute_metrics[0]:
+                    metrics_denom = acc_steps  # only computed on last log window step
+                    avg_explained_variance[name] += float(
+                        out.explained_variance.detach() / metrics_denom
+                    )
+                    avg_explained_variance_legacy[name] += float(
+                        out.explained_variance_legacy.detach() / metrics_denom
+                    )
+                    avg_unexplained_variance_legacy[name] += float(
+                        out.unexplained_variance_legacy.detach() / metrics_denom
+                    )
+                    avg_per_token_l0[name] += float(out.per_token_l0 / metrics_denom)
+                    avg_per_sequence_l0[name] += float(out.per_sequence_l0 / metrics_denom)
+                    avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / metrics_denom)
+                    avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / metrics_denom)
+                    avg_per_token_l1[name] += float(out.per_token_l1 / metrics_denom)
+                    avg_per_sequence_l1[name] += float(out.per_sequence_l1 / metrics_denom)
+                    avg_per_batch_l1[name] += float(out.per_batch_l1.sum() / metrics_denom)
+                    avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / metrics_denom)
+                    avg_mse_loss[name] += float(out.mse_loss / metrics_denom)
+                    avg_norm_mse_loss[name] += float(out.norm_mse_loss / metrics_denom)
+                    avg_l2_loss[name] += float(out.l2_loss / metrics_denom)
+                    avg_l2_ratio[name] += float(out.l2_ratio / metrics_denom)
+                    avg_cossim[name] += float(out.cossim / metrics_denom)
+                    avg_relative_reconstruction_bias[name] += float(
+                        out.relative_reconstruction_bias / metrics_denom
+                    )
+                    avg_frac_alive[name] += float(out.frac_alive / metrics_denom)
+                    avg_frac_dead[name] += float(out.frac_dead / metrics_denom)
 
                 prev_modules = [mod for mod in runner.outputs.keys() if mod != name]
                 prev_modules = [self.saes[mod] for mod in prev_modules]
@@ -1006,18 +1017,30 @@ class Trainer:
                     if self.cfg.loss_fn == "kl-fvu"
                     else []
                 )
-                clean_logits = (
-                    self.model(x).logits
-                    if self.cfg.loss_fn in ("kl", "kl-fvu")
-                    else None
-                )
+                # Wrap in no_grad: base model activations aren't needed for backward.
+                # Hooks re-enable grads for SAE ops via torch.enable_grad().
+                with torch.no_grad():
+                    if self.cfg.loss_fn in ("kl", "kl-fvu"):
+                        clean_logits = self.model(x).logits
+                        clean_log_probs = clean_logits.log_softmax(dim=-1)
+                        clean_probs = clean_logits.softmax(dim=-1)
+                        del clean_logits  # free ~4 GB [B, seq, vocab]
+                    else:
+                        clean_log_probs = None
+                        clean_probs = None
                 for handle in handles:
                     handle.remove()
-                clean_probs = (
-                    clean_logits.softmax(dim=-1)
-                    if self.cfg.loss_fn in ("kl", "kl-fvu")
-                    else None
-                )
+
+            # Decide whether to compute full metrics on this sub-step.
+            # Only compute expensive metrics on the last sub-step before a
+            # logging boundary to save GPU memory on all other steps.
+            next_step = self.global_step + 1
+            opt_step, substep_preview = divmod(next_step, acc_steps)
+            is_logging_step = (
+                substep_preview == 0
+                and (opt_step) % self.cfg.wandb_log_frequency == 0
+            )
+            _compute_metrics[0] = is_logging_step
 
             # Forward pass on the model to get the next batch of activations
             handles = [
@@ -1045,12 +1068,12 @@ class Trainer:
                             dirty_lps = self.model(x).logits.log_softmax(dim=-1)
                             kl = torch.sum(
                                 clean_probs
-                                * (clean_logits.log_softmax(dim=-1) - dirty_lps),
+                                * (clean_log_probs - dirty_lps),
                                 dim=-1,
                             ).mean()
                             acc_top1 = (
                                 (
-                                    clean_logits.argmax(dim=-1)
+                                    clean_log_probs.argmax(dim=-1)
                                     == dirty_lps.argmax(dim=-1)
                                 )
                                 .float()
@@ -1332,6 +1355,7 @@ class Trainer:
         acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
+        _compute_metrics = [True]
 
         # Logging accumulators
         avg_explained_variance = defaultdict(float)
@@ -1368,6 +1392,15 @@ class Trainer:
 
             runner.reset()
             num_tokens_in_step += bos_mask.numel()
+
+            # Decide whether to compute full metrics on this sub-step
+            next_step = self.global_step + 1
+            opt_step, substep_preview = divmod(next_step, acc_steps)
+            is_logging_step = (
+                substep_preview == 0
+                and (opt_step) % self.cfg.wandb_log_frequency == 0
+            )
+            _compute_metrics[0] = is_logging_step
 
             for name in self.cfg.hookpoints:
                 inputs = batch["inputs"][name].to(device).flatten(0, 1)
@@ -1411,6 +1444,7 @@ class Trainer:
                     module_name=name,
                     detach_grad=True,
                     loss_mask=(~bos_mask_mesh),
+                    compute_metrics=_compute_metrics[0],
                 )
 
                 assert isinstance(out, ForwardOutput)
@@ -1422,37 +1456,41 @@ class Trainer:
                 did_fire[name][latent_indices] = True
                 self.maybe_all_reduce(did_fire[name], "max")
 
-                # Accumulate metrics
-                avg_explained_variance[name] += float(
-                    out.explained_variance.detach() / denom
-                )
-                avg_explained_variance_legacy[name] += float(
-                    out.explained_variance_legacy.detach() / denom
-                )
+                # Always accumulate the loss
                 avg_unexplained_variance[name] += float(
                     out.unexplained_variance.detach() / denom
                 )
-                avg_unexplained_variance_legacy[name] += float(
-                    out.unexplained_variance_legacy.detach() / denom
-                )
-                avg_per_token_l0[name] += float(out.per_token_l0 / denom)
-                avg_per_sequence_l0[name] += float(out.per_sequence_l0 / denom)
-                avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / denom)
-                avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / denom)
-                avg_per_token_l1[name] += float(out.per_token_l1 / denom)
-                avg_per_sequence_l1[name] += float(out.per_sequence_l1 / denom)
-                avg_per_batch_l1[name] += float(out.per_batch_l1.sum() / denom)
-                avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / denom)
-                avg_mse_loss[name] += float(out.mse_loss / denom)
-                avg_norm_mse_loss[name] += float(out.norm_mse_loss / denom)
-                avg_l2_loss[name] += float(out.l2_loss / denom)
-                avg_l2_ratio[name] += float(out.l2_ratio / denom)
-                avg_cossim[name] += float(out.cossim / denom)
-                avg_relative_reconstruction_bias[name] += float(
-                    out.relative_reconstruction_bias / denom
-                )
-                avg_frac_alive[name] += float(out.frac_alive / denom)
-                avg_frac_dead[name] += float(out.frac_dead / denom)
+
+                # Only accumulate expensive metrics when computed
+                if _compute_metrics[0]:
+                    metrics_denom = acc_steps
+                    avg_explained_variance[name] += float(
+                        out.explained_variance.detach() / metrics_denom
+                    )
+                    avg_explained_variance_legacy[name] += float(
+                        out.explained_variance_legacy.detach() / metrics_denom
+                    )
+                    avg_unexplained_variance_legacy[name] += float(
+                        out.unexplained_variance_legacy.detach() / metrics_denom
+                    )
+                    avg_per_token_l0[name] += float(out.per_token_l0 / metrics_denom)
+                    avg_per_sequence_l0[name] += float(out.per_sequence_l0 / metrics_denom)
+                    avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / metrics_denom)
+                    avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / metrics_denom)
+                    avg_per_token_l1[name] += float(out.per_token_l1 / metrics_denom)
+                    avg_per_sequence_l1[name] += float(out.per_sequence_l1 / metrics_denom)
+                    avg_per_batch_l1[name] += float(out.per_batch_l1.sum() / metrics_denom)
+                    avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / metrics_denom)
+                    avg_mse_loss[name] += float(out.mse_loss / metrics_denom)
+                    avg_norm_mse_loss[name] += float(out.norm_mse_loss / metrics_denom)
+                    avg_l2_loss[name] += float(out.l2_loss / metrics_denom)
+                    avg_l2_ratio[name] += float(out.l2_ratio / metrics_denom)
+                    avg_cossim[name] += float(out.cossim / metrics_denom)
+                    avg_relative_reconstruction_bias[name] += float(
+                        out.relative_reconstruction_bias / metrics_denom
+                    )
+                    avg_frac_alive[name] += float(out.frac_alive / metrics_denom)
+                    avg_frac_dead[name] += float(out.frac_dead / metrics_denom)
 
                 loss = out.unexplained_variance / acc_steps
                 scaler.scale(loss).backward()

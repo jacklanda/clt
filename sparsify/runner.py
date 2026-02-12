@@ -30,6 +30,7 @@ class CrossLayerRunner(object):
         module_name: str,
         detach_grad: bool = False,
         advance: bool = True,
+        compute_metrics: bool = True,
         **kwargs,
     ) -> ForwardOutput:
         self.outputs[module_name] = mid_out
@@ -66,10 +67,14 @@ class CrossLayerRunner(object):
                     or mid_out.sparse_coder.cfg.secondary_target_tied,
                     denormalize=(hookpoint == module_name)
                     and not mid_out.sparse_coder.cfg.secondary_target_tied,
+                    compute_metrics=compute_metrics,
                     **kwargs,
                 )
                 if hookpoint != module_name:
                     output += out.y_hat
+                # Free stale MidDecoder.x after last decode
+                if advance and hookpoint in to_delete:
+                    del layer_mid.x
             else:
                 layer_mid.next()
 
@@ -88,6 +93,7 @@ class CrossLayerRunner(object):
                 no_extras=False,
                 denormalize=True,
                 addition=out.y_hat,
+                compute_metrics=compute_metrics,
                 **kwargs,
             )
 
@@ -126,7 +132,7 @@ class CrossLayerRunner(object):
                     activations=best_values,
                     dead_mask=kwargs.pop("loss_mask"),
                 )
-                out = new_mid_out(y, index=0, add_post_enc=False, **kwargs)
+                out = new_mid_out(y, index=0, add_post_enc=False, compute_metrics=compute_metrics, **kwargs)
                 if advance:
                     del mid_out.x
             elif mid_out.sparse_coder.cfg.coalesce_topk == "per-layer":
@@ -142,6 +148,7 @@ class CrossLayerRunner(object):
                     y,
                     index=0,
                     add_post_enc=False,
+                    compute_metrics=compute_metrics,
                     **kwargs,
                 )
                 if isinstance(out.latent_indices, DTensor):
@@ -158,6 +165,8 @@ class CrossLayerRunner(object):
                         latent_indices=(out.latent_indices % num_latents)
                         * (out.latent_indices // num_latents == i),
                     )
+                if advance:
+                    del mid_out.x
             else:
                 raise ValueError("Not implemented")
 
@@ -183,13 +192,15 @@ class CrossLayerRunner(object):
         detach_grad: bool = False,
         dead_mask: Tensor | None = None,
         loss_mask: Tensor | None = None,
+        compute_metrics: bool = True,
         *,
         encoder_kwargs: dict = {},
         decoder_kwargs: dict = {},
     ):
         mid_out = self.encode(x, sparse_coder, dead_mask=dead_mask, **encoder_kwargs)
         return self.decode(
-            mid_out, y, module_name, detach_grad, loss_mask=loss_mask, **decoder_kwargs
+            mid_out, y, module_name, detach_grad, loss_mask=loss_mask,
+            compute_metrics=compute_metrics, **decoder_kwargs
         )
 
     def restore(self):

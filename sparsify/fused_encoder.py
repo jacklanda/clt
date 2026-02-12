@@ -10,6 +10,14 @@ try:
 except ImportError:
     rtopk = None
 
+try:
+    import triton
+    import triton.language as tl
+
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 from .kernels import (
     COODecoder,
     triton_coo_sparse_dense_matmul,
@@ -20,8 +28,221 @@ from .utils import decoder_impl
 
 NO_COMPILE = os.environ.get("SPARSIFY_NO_COMPILE", "0") == "1"
 NO_RTOPK = os.environ.get("SPARSIFY_NO_RTOPK", "1") == "1"
+# Environment variable override for tile size (0=auto, -1=disabled, >0=explicit)
+ENV_TILE_SIZE = int(os.environ.get("SPARSIFY_TILE_SIZE", "0"))
 
 MAX_SIZE = 1024
+
+
+# ---------------------------------------------------------------------------
+# Triton kernel: fused tiled matmul + ReLU + top-k
+# Processes the encoder weight matrix in tiles so the full [N, num_latents]
+# preactivation tensor is never materialized in HBM.
+# ---------------------------------------------------------------------------
+if HAS_TRITON:
+
+    @triton.jit
+    def _tiled_encode_topk_kernel(
+        # Pointers
+        x_ptr,
+        w_ptr,
+        b_ptr,
+        out_vals_ptr,
+        out_idxs_ptr,
+        # Dimensions
+        D_in,
+        D_latent,
+        # Strides
+        stride_xn,
+        stride_wl,
+        # Compile-time constants
+        K: tl.constexpr,
+        TILE_L: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Fused tiled encoder: matmul + ReLU + streaming top-k.
+
+        Each program instance handles one input row. It iterates over tiles
+        of the latent dimension, computing dot-products in register, applying
+        ReLU, and maintaining a running top-K buffer without ever writing the
+        full preactivation vector to global memory.
+        """
+        row_id = tl.program_id(0)
+
+        # ---- initialise running top-k in registers ----
+        k_offs = tl.arange(0, K)
+        topk_vals = tl.full([K], value=-1e30, dtype=tl.float32)
+        topk_idxs = tl.zeros([K], dtype=tl.int32)
+
+        # ---- iterate over latent tiles ----
+        for tile_start in range(0, D_latent, TILE_L):
+            l_offs = tl.arange(0, TILE_L)
+            l_mask = (tile_start + l_offs) < D_latent
+
+            # Compute dot products for this tile: tile_preacts[j] = x @ w[tile_start+j]
+            tile_preacts = tl.zeros([TILE_L], dtype=tl.float32)
+            for d_start in range(0, D_in, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_mask = d_offs < D_in
+
+                x_block = tl.load(
+                    x_ptr + row_id * stride_xn + d_offs,
+                    mask=d_mask,
+                    other=0.0,
+                ).to(tl.float32)
+
+                # [TILE_L, BLOCK_D]
+                w_block = tl.load(
+                    w_ptr + (tile_start + l_offs[:, None]) * stride_wl + d_offs[None, :],
+                    mask=l_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+
+                tile_preacts += tl.sum(w_block * x_block[None, :], axis=1)
+
+            # Add bias + ReLU
+            tile_bias = tl.load(b_ptr + tile_start + l_offs, mask=l_mask, other=0.0).to(
+                tl.float32
+            )
+            tile_preacts = tl.maximum(tile_preacts + tile_bias, 0.0)
+            tile_preacts = tl.where(l_mask, tile_preacts, -1e30)
+
+            # ---- merge tile into running top-k ----
+            # Concatenate [topk_vals, tile_preacts] and [topk_idxs, tile_idxs]
+            # then pick the top-K.  We use an iterative replacement strategy:
+            # for each tile element, if it beats the current min of topk, swap.
+            cur_min = tl.min(topk_vals)
+            for j in tl.static_range(TILE_L):
+                # Extract scalar from tile_preacts[j]
+                val = tl.sum(
+                    tl.where(
+                        l_offs == j,
+                        tile_preacts,
+                        tl.zeros([TILE_L], dtype=tl.float32),
+                    )
+                )
+                if val > cur_min:
+                    # Find the first position holding the minimum
+                    is_min_mask = topk_vals == cur_min
+                    # Build a replacement mask: only the first True position
+                    # Use cumsum trick: cumsum of is_min_mask, replace where cumsum==1
+                    cum = tl.cumsum(is_min_mask.to(tl.int32), axis=0)
+                    replace_mask = is_min_mask & (cum == 1)
+                    topk_vals = tl.where(replace_mask, val, topk_vals)
+                    topk_idxs = tl.where(
+                        replace_mask, (tile_start + j).to(tl.int32), topk_idxs
+                    )
+                    cur_min = tl.min(topk_vals)
+
+        # ---- store results ----
+        tl.store(out_vals_ptr + row_id * K + k_offs, topk_vals, mask=k_offs < K)
+        tl.store(out_idxs_ptr + row_id * K + k_offs, topk_idxs, mask=k_offs < K)
+
+
+def _tiled_topk_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    k: int,
+    tile_l: int = 64,
+    block_d: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the fused tiled-encode top-k Triton kernel."""
+    N, D_in = x.shape
+    D_latent = weight.shape[0]
+
+    out_vals = torch.empty(N, k, device=x.device, dtype=torch.float32)
+    out_idxs = torch.empty(N, k, device=x.device, dtype=torch.int32)
+
+    # Constexpr parameters must be powers of two for Triton
+    tile_l_po2 = triton.next_power_of_2(min(tile_l, D_latent))
+    block_d_po2 = triton.next_power_of_2(min(block_d, D_in))
+    k_po2 = triton.next_power_of_2(k)
+
+    grid = (N,)
+    _tiled_encode_topk_kernel[grid](
+        x,
+        weight,
+        bias,
+        out_vals,
+        out_idxs,
+        D_in,
+        D_latent,
+        x.stride(0),
+        weight.stride(0),
+        K=k_po2,
+        TILE_L=tile_l_po2,
+        BLOCK_D=block_d_po2,
+    )
+
+    # Trim padding if k was rounded up
+    if k_po2 != k:
+        # Take actual top-k from the padded result
+        topk = out_vals[:, :k_po2].topk(k, dim=-1, sorted=False)
+        out_vals = topk.values
+        out_idxs = out_idxs.gather(-1, topk.indices)
+    return out_vals.to(x.dtype), out_idxs.long()
+
+
+def _tiled_topk_pytorch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    k: int,
+    tile_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Memory-efficient top-k via PyTorch tiling (fallback when Triton unavailable
+    or for large tile sizes where the Triton kernel's register pressure is too high).
+
+    Processes the encoder weight matrix in tiles of ``tile_size`` latents.
+    Peak activation memory drops from O(N * num_latents) to
+    O(N * tile_size + N * 2k).
+    """
+    N = x.shape[0]
+    num_latents = weight.shape[0]
+
+    global_vals = x.new_full((N, k), float("-inf"))
+    global_idxs = torch.zeros(N, k, device=x.device, dtype=torch.long)
+
+    for start in range(0, num_latents, tile_size):
+        end = min(start + tile_size, num_latents)
+
+        # Materialise only one tile of preactivations at a time
+        tile_preacts = F.linear(x, weight[start:end], bias[start:end])
+        tile_preacts.relu_()
+
+        local_k = min(k, end - start)
+        tile_vals, tile_idxs = torch.topk(tile_preacts, local_k, dim=-1, sorted=False)
+        tile_idxs = tile_idxs + start  # offset to global latent indices
+
+        del tile_preacts  # free HBM immediately
+
+        # Merge with running global top-k
+        merged_vals = torch.cat([global_vals, tile_vals], dim=-1)
+        merged_idxs = torch.cat([global_idxs, tile_idxs], dim=-1)
+
+        best = torch.topk(merged_vals, k, dim=-1, sorted=False)
+        global_vals = best.values
+        global_idxs = merged_idxs.gather(-1, best.indices)
+
+    return global_vals, global_idxs
+
+
+def _resolve_tile_size(num_latents: int, k: int, cfg_tile_size: int) -> int:
+    """Decide the effective tile size.
+
+    Returns 0 when tiling should be skipped (standard path).
+    """
+    # Explicit env-var override takes priority
+    ts = ENV_TILE_SIZE if ENV_TILE_SIZE != 0 else cfg_tile_size
+    if ts == -1:
+        return 0  # disabled
+    if ts > 0:
+        return ts
+    # Auto-detect: tile when num_latents is large enough to matter
+    if num_latents <= 8192:
+        return 0
+    return max(4096, 4 * k)
 
 
 @torch.compile
@@ -297,6 +518,7 @@ def fused_encoder(
     k: int,
     activation: Literal["groupmax", "topk"],
     use_fp8: bool = False,
+    tile_size: int = 0,
 ) -> EncoderOutput:
     """
     Convenience wrapper that performs an nn.Linear followed by `activation` with
@@ -306,7 +528,85 @@ def fused_encoder(
     weight: (M, D)
     bias:   (M,)
     k:      int (number of top elements to select along dim=1)
+    tile_size: int (0=auto, -1=disabled, >0=explicit tile size for memory-efficient encoding)
     """
+    # ---- Memory-efficient tiled path ----
+    # Only for topk activation, non-FP8
+    effective_tile = _resolve_tile_size(weight.shape[0], k, tile_size)
+    if (
+        effective_tile > 0
+        and activation == "topk"
+        and not use_fp8
+    ):
+        # --- DTensor tiled path ---
+        if isinstance(input, dtensor.DTensor):
+            mesh = input.device_mesh
+            local_input = input.to_local()
+            local_weight = weight.to_local()
+            local_bias = bias.to_local()
+            local_num_latents = local_weight.shape[0]
+            local_tile = _resolve_tile_size(local_num_latents, k, tile_size)
+
+            if local_tile > 0:
+                with torch.no_grad():
+                    local_values, local_indices = _tiled_topk_pytorch(
+                        local_input, local_weight, local_bias, k,
+                        tile_size=local_tile,
+                    )
+                    # Offset to global latent indices
+                    local_indices += mesh.get_local_rank(1) * local_num_latents
+
+                    # Gather across TP ranks and do final top-k
+                    values_dt = dtensor.DTensor.from_local(
+                        local_values, mesh,
+                        (dtensor.Shard(0), dtensor.Shard(1)),
+                    ).redistribute(mesh, (dtensor.Shard(0), dtensor.Replicate()))
+                    indices_dt = dtensor.DTensor.from_local(
+                        local_indices, mesh,
+                        (dtensor.Shard(0), dtensor.Shard(1)),
+                    ).redistribute(mesh, (dtensor.Shard(0), dtensor.Replicate()))
+
+                    lv, li = values_dt.to_local(), indices_dt.to_local()
+                    lv, li_ = rtopk_topk(lv, k=k)
+                    li = torch.gather(li, 1, li_.long())
+
+                    values = dtensor.DTensor.from_local(
+                        lv, mesh, (dtensor.Shard(0), dtensor.Replicate()),
+                    )
+                    indices = dtensor.DTensor.from_local(
+                        li, mesh, (dtensor.Shard(0), dtensor.Replicate()),
+                    )
+
+                values = FusedEncoder.apply(
+                    input, weight, bias, values, indices, activation
+                )
+                return EncoderOutput(top_acts=values, top_indices=indices)
+            # else: fall through to standard path
+
+        # --- Non-DTensor tiled path ---
+        elif not isinstance(input, dtensor.DTensor):
+            with torch.no_grad():
+                use_triton_tiled = (
+                    HAS_TRITON
+                    and effective_tile <= 128
+                    and k <= 128
+                    and input.is_cuda
+                )
+                if use_triton_tiled:
+                    values, indices = _tiled_topk_triton(
+                        input, weight, bias, k, tile_l=effective_tile
+                    )
+                else:
+                    values, indices = _tiled_topk_pytorch(
+                        input, weight, bias, k, tile_size=effective_tile
+                    )
+
+            values = FusedEncoder.apply(
+                input, weight, bias, values, indices, activation
+            )
+            return EncoderOutput(top_acts=values, top_indices=indices)
+
+    # ---- Standard (non-tiled) path ----
     with torch.no_grad():
         preacts = linear(input, weight, bias, use_fp8)
         preacts.relu_()

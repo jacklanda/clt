@@ -275,10 +275,10 @@ class CachedActivationDataset(TorchDataset):
         for name in self.hookpoints:
             inputs[name] = torch.from_numpy(
                 self.memmaps[name]["inputs"][start:end].copy()
-            ).float()
+            ).half()
             outputs[name] = torch.from_numpy(
                 self.memmaps[name]["outputs"][start:end].copy()
-            ).float()
+            ).half()
 
         bos_mask = torch.from_numpy(
             self.memmaps[self.hookpoints[0]]["bos_mask"][start:end].copy()

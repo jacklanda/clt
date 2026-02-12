@@ -162,6 +162,11 @@ class MidDecoder:
         self.latent_acts = self.original_activations
         self.latent_acts.backward(grad, retain_graph=not is_last)
         del self.original_activations
+        if is_last:
+            # Free tensors no longer needed after backward
+            del self.latent_acts, self.latent_indices
+            if hasattr(self, "x"):
+                del self.x
 
     def next(self):
         self.index += 1
@@ -242,6 +247,7 @@ class MidDecoder:
         lm: LanguageModel = None,  # nnsight LanguageModel
         submodule: str = None,  # submodule to intervene on
         texts: List[str] = None,  # text batch for loss calculation
+        compute_metrics: bool = True,
     ) -> ForwardOutput:
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
@@ -298,14 +304,28 @@ class MidDecoder:
             if loss_mask is not None:
                 error = error * loss_mask[..., None]
 
-            # Used as a denominator for putting everything on a reasonable scale
-            # if loss_mask is None:
-            # total_variance_old = (y - y.mean(0)).pow(2).sum()
-            # pass
-            # else:
-            # lm = loss_mask[..., None]
-            # y_mean = (y * lm).sum(0) / lm.sum(0)
-            # total_variance_old = (y - y_mean).pow(2).mul(lm).sum()
+            # ---- Fast path: only compute what the loss needs ----
+            if not compute_metrics:
+                resid_sum_of_squares = error.pow(2).sum(dim=-1)
+                mean_sum_of_squares = y.pow(2).sum(dim=-1).mean(dim=0)
+                mean_act_per_dimension = y.pow(2).mean()
+                residual_variance = resid_sum_of_squares.mean(dim=0)
+                total_variance_new = mean_sum_of_squares - mean_act_per_dimension.pow(2)
+                unexplained_variance = 1.0 - (1 - residual_variance / total_variance_new)
+
+                _zero = y_hat.new_tensor(0.0)
+                return ForwardOutput(
+                    y_hat=y_hat,
+                    latent_acts=self.latent_acts,
+                    latent_indices=self.latent_indices,
+                    explained_variance=_zero,
+                    explained_variance_legacy=_zero,
+                    unexplained_variance=unexplained_variance,
+                    unexplained_variance_legacy=unexplained_variance,
+                    is_last=is_last,
+                )
+
+            # ---- Full metrics path (used on logging steps) ----
 
             # (per-token) MSE loss (A)
             # standard_mse_loss = error.pow(2).sum(dim=-1).mean()
@@ -322,19 +342,17 @@ class MidDecoder:
             y_centered = y - y.mean(0, keepdim=True)
             normalization = y_centered.norm(dim=-1, keepdim=True)
             norm_mse_loss = (error / (normalization + 1e-6)).pow(2).sum(dim=-1).mean()
-            # norm_mse_loss = torch.nn.functional.mse_loss(y_hat, y, reduction="none") / (
-            # normalization + 1e-6
-            # )
 
             # explained_variance (legacy & new): https://github.com/decoderesearch/SAELens/pull/443
-            resid_sum_of_squares = error.pow(2).sum(dim=-1)
+            resid_sum_of_squares = squared_error.sum(dim=-1)  # reuse squared_error
             batched_variance_sum = (y - y.mean(dim=0)).pow(2).sum(dim=-1)
             explained_variance_legacy = 1 - (
                 resid_sum_of_squares / batched_variance_sum
             ).mean(dim=0)
 
-            mean_sum_of_squares = y.pow(2).sum(dim=-1).mean(dim=0)
-            mean_act_per_dimension = y.pow(2).mean()
+            y_squared = y.pow(2)  # compute once, reuse below
+            mean_sum_of_squares = y_squared.sum(dim=-1).mean(dim=0)
+            mean_act_per_dimension = y_squared.mean()
             residual_variance = resid_sum_of_squares.mean(dim=0)
             total_variance_new = mean_sum_of_squares - mean_act_per_dimension.pow(2)
             explained_variance = 1 - residual_variance / total_variance_new
@@ -930,6 +948,7 @@ class SparseCoder(nn.Module):
             self.cfg.k,
             self.cfg.activation,
             self.cfg.use_fp8,
+            self.cfg.encoder_tile_size,
         )
 
     def decode(
