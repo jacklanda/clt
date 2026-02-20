@@ -97,7 +97,7 @@ def chunk_and_tokenize(
         # since we always throw away the last element of the batch we
         # want to keep the batch size as large as possible
         batched=True,
-        batch_size=2048,
+        batch_size=8192,
         num_proc=num_proc,
         remove_columns=get_columns_all_equal(data),
         load_from_cache_file=load_from_cache_file,

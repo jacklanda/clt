@@ -127,6 +127,9 @@ def resolve_widths(
         model.base_model.get_submodule(name): name for name in module_names
     }
     shapes: dict[str, int] = {}
+    # Fallback shapes from pre-hooks (input dims), used when forward hooks
+    # can't fire due to errors inside the module (e.g., MoE nonzero() with DTensor)
+    fallback_shapes: dict[str, int] = {}
 
     def hook(module, inputs, output):
         # Unpack tuples if needed
@@ -146,7 +149,17 @@ def resolve_widths(
         name = module_to_name[module]
         shapes[name] = tensor.shape[dim]
 
+    def pre_hook(module, inputs):
+        """Capture input shapes as fallback for when forward hooks can't fire."""
+        if isinstance(inputs, tuple):
+            tensor = inputs[0]
+        else:
+            tensor = inputs
+        name = module_to_name[module]
+        fallback_shapes[name] = tensor.shape[dim]
+
     handles = [mod.register_forward_hook(hook) for mod in module_to_name]
+    pre_handles = [mod.register_forward_pre_hook(pre_hook) for mod in module_to_name]
     with torch.inference_mode() if mesh is None else torch.no_grad():
         # Don't use distribute_tensor here because:
         # 1. This is only inference to get shapes, not actual training
@@ -157,9 +170,37 @@ def resolve_widths(
             # Disable torch.compile during shape inference to avoid FakeTensorMode conflicts with DTensor
             # Use disable() as a decorator-style call instead of context manager
             torch._dynamo.disable()(lambda: model(**dummy))()
+        except Exception:
+            # Some models (e.g., MoE with nonzero()) raise DynamicOutputShapeException
+            # from DTensor's FakeTensorMode during sharding propagation.
+            # Fall back to input shapes captured by pre-hooks for any missing modules.
+            for name in module_names:
+                if name not in shapes and name in fallback_shapes:
+                    shapes[name] = fallback_shapes[name]
         finally:
             for handle in handles:
                 handle.remove()
+            for handle in pre_handles:
+                handle.remove()
+
+    # Final fallback: infer widths from module parameters (e.g., nn.Linear weight shape)
+    # when the forward pass fails before reaching certain modules (common with MoE gates).
+    if missing := set(module_names) - set(shapes):
+        for name in list(missing):
+            mod = model.base_model.get_submodule(name)
+            weight = getattr(mod, "weight", None)
+            if weight is not None and weight.ndim >= 2:
+                if use_input_dim:
+                    shapes[name] = weight.shape[1]
+                else:
+                    shapes[name] = weight.shape[0]
+                missing.discard(name)
+
+    if missing := set(module_names) - set(shapes):
+        raise RuntimeError(
+            f"Could not resolve widths for modules: {missing}. "
+            "The forward pass may have failed before these modules were reached."
+        )
 
     return shapes
 

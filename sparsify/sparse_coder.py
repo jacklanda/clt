@@ -7,6 +7,7 @@ from typing import Optional, List
 
 import einops
 import torch
+import torch.distributed as dist
 import einops
 from huggingface_hub import snapshot_download
 from natsort import natsorted
@@ -20,6 +21,38 @@ from nnsight import LanguageModel
 from .config import SparseCoderConfig
 from .fused_encoder import NO_COMPILE, EncoderOutput, fused_encoder
 from .utils import decoder_impl, load_sharded, save_sharded
+
+
+
+from torch.utils._python_dispatch import _disable_current_modes
+
+
+def _all_reduce_detached(t: Tensor) -> Tensor:
+    """All_reduce a detached DTensor with Partial placements.
+
+    Bypasses DTensor dispatch by:
+    1. Creating a fresh plain tensor via torch.empty (never a DTensor subclass)
+    2. Disabling all Python dispatch modes during dist.all_reduce
+
+    Only use on tensors that do NOT need gradients.
+    """
+    if not isinstance(t, dtensor.DTensor):
+        return t
+    has_partial = any(isinstance(p, dtensor.Partial) for p in t.placements)
+    if not has_partial:
+        return t
+    # torch.empty always creates a plain torch.Tensor, never a subclass.
+    src = t._local_tensor
+    local = torch.empty(src.shape, dtype=src.dtype, device=src.device)
+    local.copy_(src)
+    for dim_idx, p in enumerate(t.placements):
+        if isinstance(p, dtensor.Partial):
+            pg = t.device_mesh.get_group(dim_idx)
+            # Disable all Python dispatch modes so dist.all_reduce uses
+            # the standard NCCL path without DTensor interception.
+            with _disable_current_modes():
+                dist.all_reduce(local, group=pg)
+    return local
 
 
 @dataclass
@@ -274,14 +307,45 @@ class MidDecoder:
             y_hat = torch.zeros_like(self.x)
         else:
             latent_indices = self.latent_indices
-            y_hat = self.sparse_coder.decode(latent_acts, latent_indices, index)
+            y_hat = self.sparse_coder.decode(latent_acts, latent_indices, index).clone()
         W_skip = (
             self.sparse_coder.W_skips[index]
             if hasattr(self.sparse_coder, "W_skips")
             else self.sparse_coder.W_skip
         )
         if W_skip is not None:
-            y_hat += self.x.to(self.sparse_coder.dtype) @ W_skip.mT
+            dtype = self.sparse_coder.dtype
+            x = self.x
+            needs_cast = x.dtype != dtype
+            _CHUNK = 256
+            if isinstance(x, dtensor.DTensor):
+                # DTensor slicing + .to(dtype) triggers expensive all_gather
+                # that causes OOM. Work with local tensors instead.
+                x_local = x.to_local()
+                y_hat_placements = y_hat.placements if isinstance(y_hat, dtensor.DTensor) else None
+                y_hat_local = y_hat.to_local().clone() if isinstance(y_hat, dtensor.DTensor) else y_hat.clone()
+                W_skip_local = W_skip.to_local() if isinstance(W_skip, dtensor.DTensor) else W_skip
+                if needs_cast and x_local.shape[0] > _CHUNK:
+                    for i in range(0, x_local.shape[0], _CHUNK):
+                        x_chunk = x_local[i : i + _CHUNK].to(dtype)
+                        y_hat_local[i : i + _CHUNK] += x_chunk @ W_skip_local.mT
+                        del x_chunk
+                else:
+                    y_hat_local += x_local.to(dtype) @ W_skip_local.mT
+                if y_hat_placements is not None:
+                    y_hat = dtensor.DTensor.from_local(
+                        y_hat_local, x.device_mesh, y_hat_placements
+                    )
+                else:
+                    y_hat = y_hat_local
+            elif needs_cast and x.shape[0] > _CHUNK:
+                # Chunk to avoid materializing the full dtype-cast copy of x
+                for i in range(0, x.shape[0], _CHUNK):
+                    x_chunk = x[i : i + _CHUNK].to(dtype)
+                    y_hat[i : i + _CHUNK] += x_chunk @ W_skip.mT
+                    del x_chunk
+            else:
+                y_hat += x.to(dtype) @ W_skip.mT
         y_hat += addition
 
         if denormalize:
@@ -304,15 +368,26 @@ class MidDecoder:
             if loss_mask is not None:
                 error = error * loss_mask[..., None]
 
-            # ---- Fast path: only compute what the loss needs ----
-            if not compute_metrics:
-                resid_sum_of_squares = error.pow(2).sum(dim=-1)
-                mean_sum_of_squares = y.pow(2).sum(dim=-1).mean(dim=0)
-                mean_act_per_dimension = y.pow(2).mean()
-                residual_variance = resid_sum_of_squares.mean(dim=0)
-                total_variance_new = mean_sum_of_squares - mean_act_per_dimension.pow(2)
-                unexplained_variance = 1.0 - (1 - residual_variance / total_variance_new)
+            # ---- Compute the loss (unexplained_variance) — always via the
+            #      DTensor-compatible fast path that preserves autograd. ----
+            resid_sum_of_squares = error.pow(2).sum(dim=-1)
+            mean_sum_of_squares = y.pow(2).sum(dim=-1).mean(dim=0)
+            mean_act_per_dimension = y.pow(2).mean()
+            residual_variance = resid_sum_of_squares.mean(dim=0)
+            total_variance_new = mean_sum_of_squares - mean_act_per_dimension.pow(2)
+            # Work around PyTorch 2.7 DTensor bug: dividing two Partial
+            # DTensors triggers an all_reduce whose sharding strategy is
+            # not registered.  total_variance_new only depends on y (no
+            # grad needed), so we detach & all_reduce it to a plain scalar
+            # via the NCCL backend.  residual_variance keeps its DTensor
+            # placement and autograd graph; multiplying a Partial DTensor
+            # by a plain scalar needs no collective and preserves grads.
+            total_variance_resolved = _all_reduce_detached(total_variance_new.detach())
+            unexplained_variance = residual_variance * (1.0 / total_variance_resolved)
+            del resid_sum_of_squares, mean_sum_of_squares, mean_act_per_dimension
+            del residual_variance, total_variance_new, total_variance_resolved
 
+            if not compute_metrics:
                 _zero = y_hat.new_tensor(0.0)
                 return ForwardOutput(
                     y_hat=y_hat,
@@ -325,106 +400,100 @@ class MidDecoder:
                     is_last=is_last,
                 )
 
-            # ---- Full metrics path (used on logging steps) ----
+            # ---- Full metrics (logging steps only) ----
+            # Compute in no_grad using detached copies so metric intermediates
+            # don't bloat the autograd graph or keep large DTensor replicas alive.
+            with torch.no_grad():
+                y_det = y.detach()
+                y_hat_det = y_hat.detach()
 
-            # (per-token) MSE loss (A)
-            # standard_mse_loss = error.pow(2).sum(dim=-1).mean()
+                # Convert DTensors to plain (replicated) tensors for metrics.
+                if isinstance(y_det, dtensor.DTensor):
+                    y_det = y_det.full_tensor()
+                if isinstance(y_hat_det, dtensor.DTensor):
+                    y_hat_det = y_hat_det.full_tensor()
 
-            # (per-token) MSE loss (B): https://github.com/ckkissane/crosscoder-model-diff-replication/blob/main/crosscoder.py#L102-L105
-            # A is equivalent to B in result
-            squared_error = error.pow(2)
-            squared_error_per_batch = einops.reduce(
-                squared_error, "bsz neuron -> bsz", "sum"
-            )
-            mse_loss = squared_error_per_batch.mean()
+                error_det = y_det - y_hat_det
 
-            # Norm MSE: https://github.com/decoderesearch/SAELens/blob/main/tests/_comparison/sae_lens_old/training/training_sae.py#L538-L545
-            y_centered = y - y.mean(0, keepdim=True)
-            normalization = y_centered.norm(dim=-1, keepdim=True)
-            norm_mse_loss = (error / (normalization + 1e-6)).pow(2).sum(dim=-1).mean()
+                # (per-token) MSE loss
+                squared_error = error_det.pow(2)
+                squared_error_per_batch = einops.reduce(
+                    squared_error, "bsz neuron -> bsz", "sum"
+                )
+                mse_loss = squared_error_per_batch.mean()
 
-            # explained_variance (legacy & new): https://github.com/decoderesearch/SAELens/pull/443
-            resid_sum_of_squares = squared_error.sum(dim=-1)  # reuse squared_error
-            batched_variance_sum = (y - y.mean(dim=0)).pow(2).sum(dim=-1)
-            explained_variance_legacy = 1 - (
-                resid_sum_of_squares / batched_variance_sum
-            ).mean(dim=0)
+                # Norm MSE
+                y_centered = y_det - y_det.mean(0, keepdim=True)
+                normalization = y_centered.norm(dim=-1, keepdim=True)
+                norm_mse_loss = (error_det / (normalization + 1e-6)).pow(2).sum(dim=-1).mean()
+                del y_centered, normalization
 
-            y_squared = y.pow(2)  # compute once, reuse below
-            mean_sum_of_squares = y_squared.sum(dim=-1).mean(dim=0)
-            mean_act_per_dimension = y_squared.mean()
-            residual_variance = resid_sum_of_squares.mean(dim=0)
-            total_variance_new = mean_sum_of_squares - mean_act_per_dimension.pow(2)
-            explained_variance = 1 - residual_variance / total_variance_new
+                # explained_variance (legacy & new)
+                resid_ss = squared_error.sum(dim=-1)
+                batched_variance_sum = (y_det - y_det.mean(dim=0)).pow(2).sum(dim=-1)
+                explained_variance_legacy = 1 - (
+                    resid_ss / batched_variance_sum
+                ).mean(dim=0)
+                del batched_variance_sum
 
-            # fraction of variance explained (FVE)
-            unexplained_variance_legacy = 1.0 - explained_variance_legacy
-            unexplained_variance = 1.0 - explained_variance
+                y_squared = y_det.pow(2)
+                ms_of_sq = y_squared.sum(dim=-1).mean(dim=0)
+                ma_per_dim = y_squared.mean()
+                res_var = resid_ss.mean(dim=0)
+                tot_var = ms_of_sq - ma_per_dim.pow(2)
+                explained_variance = 1 - res_var / tot_var
+                del y_squared, resid_ss
 
-            # L2 loss: https://github.com/science-of-finetuning/sparsity-artifacts-crosscoders/blob/ad9d9dd777624638b9c0c33d5e21fdbfaa05f778/tools/latent_scaler/scaler_training.py#L147-L149
-            l2_loss = torch.linalg.norm(error, dim=-1).mean()
+                unexplained_variance_legacy = 1.0 - explained_variance_legacy
 
-            # L2 norm
-            l2_norm_in = torch.norm(y, dim=-1)
-            l2_norm_out = torch.norm(y_hat, dim=-1)
-            l2_norm_in_for_div = l2_norm_in.clone()
-            # l2_norm_in_for_div[torch.abs(l2_norm_in_for_div) < 1e-4] = 1
-            l2_ratio = (l2_norm_out / l2_norm_in_for_div).mean()
+                # L2 loss
+                l2_loss = torch.linalg.norm(error_det, dim=-1).mean()
 
-            # Relative reconstruction bias
-            y_hat_norm_squared = torch.norm(y_hat, dim=-1).pow(2)
-            y_dot_y_hat = (y * y_hat).sum(dim=-1)
-            relative_reconstruction_bias = (
-                y_hat_norm_squared.mean() / y_dot_y_hat.mean()
-            )
+                # L2 norm ratio
+                l2_norm_in = torch.norm(y_det, dim=-1)
+                l2_norm_out = torch.norm(y_hat_det, dim=-1)
+                l2_ratio = (l2_norm_out / l2_norm_in.clone()).mean()
+                del l2_norm_in, l2_norm_out
 
-            # Cosine similarity between target and reconstruction
-            y_normed = y / torch.linalg.norm(y, dim=-1, keepdim=True)
-            y_hat_normed = y_hat / torch.linalg.norm(y_hat, dim=-1, keepdim=True)
-            cossim = (y_normed * y_hat_normed).sum(dim=-1).mean()
+                # Relative reconstruction bias
+                y_hat_norm_squared = torch.norm(y_hat_det, dim=-1).pow(2)
+                y_dot_y_hat = (y_det * y_hat_det).sum(dim=-1)
+                relative_reconstruction_bias = (
+                    y_hat_norm_squared.mean() / y_dot_y_hat.mean()
+                )
+                del y_hat_norm_squared, y_dot_y_hat
 
-            # L0 & L1 sparsity: fraction of latents used
-            context_stripe = 128
-            per_token_l0 = (
-                (latent_acts != 0).float().sum(dim=-1).mean()
-            )  # Shape: Scalar
+                # Cosine similarity
+                y_normed = y_det / torch.linalg.norm(y_det, dim=-1, keepdim=True)
+                y_hat_normed = y_hat_det / torch.linalg.norm(y_hat_det, dim=-1, keepdim=True)
+                cossim = (y_normed * y_hat_normed).sum(dim=-1).mean()
+                del y_normed, y_hat_normed, y_det, y_hat_det, error_det, squared_error
 
-            # per "ctx_len" as a sequence in the batch
-            latent_acts_reshaped = latent_acts.view(
-                latent_acts.shape[0] // context_stripe,
-                context_stripe,
-                latent_acts.shape[1],
-            )
-            per_sequence_l0 = (
-                (latent_acts_reshaped != 0).float().sum(dim=(1, 2)).mean()
-            )  # Shape: Scalar
+                # L0 & L1 sparsity
+                context_stripe = 128
+                per_token_l0 = (latent_acts != 0).float().sum(dim=-1).mean()
 
-            per_batch_l0 = (latent_acts != 0).float().sum()  # batch l0, Scalar
-            per_feature_l0 = (
-                (latent_acts != 0).float().sum(dim=0)
-            )  # Shape: (num_latents,)
+                latent_acts_reshaped = latent_acts.view(
+                    latent_acts.shape[0] // context_stripe,
+                    context_stripe,
+                    latent_acts.shape[1],
+                )
+                per_sequence_l0 = (
+                    (latent_acts_reshaped != 0).float().sum(dim=(1, 2)).mean()
+                )
+                per_batch_l0 = (latent_acts != 0).float().sum()
+                per_feature_l0 = (latent_acts != 0).float().sum(dim=0)
 
-            per_token_l1 = latent_acts.abs().sum().mean()  # Shape: Scalar
-            per_sequence_l1 = (
-                latent_acts_reshaped.abs().sum(dim=(1, 2)).mean()
-            )  # Shape: Scalar
-            per_batch_l1 = latent_acts.abs().sum()  # batch l1, Scalar
-            per_feature_l1 = latent_acts.abs().sum(dim=0)  # Shape: (num_latents,)
+                per_token_l1 = latent_acts.abs().sum().mean()
+                per_sequence_l1 = latent_acts_reshaped.abs().sum(dim=(1, 2)).mean()
+                per_batch_l1 = latent_acts.abs().sum()
+                per_feature_l1 = latent_acts.abs().sum(dim=0)
 
-            # fraction of dead latents
-            # if self.dead_mask is not None:
-            # num_dead = self.dead_mask.sum().item()
-            # total_latents = self.dead_mask.numel()
-            # frac_dead = num_dead / total_latents
-            # else:
-            # frac_dead = torch.tensor(0.0)
-
-            assert len(latent_acts.shape) == 2, "latent_acts must be 2D"
-            frac_alive = (
-                latent_acts.sum(dim=0) != 0
-            ).float().sum() / latent_acts.shape[1]
-
-            frac_dead = 1.0 - frac_alive
+                assert len(latent_acts.shape) == 2, "latent_acts must be 2D"
+                frac_alive = (
+                    latent_acts.sum(dim=0) != 0
+                ).float().sum() / latent_acts.shape[1]
+                frac_dead = 1.0 - frac_alive
 
             # Cross-entropy losses of language models (optional)
             loss_original = torch.tensor(0.0)

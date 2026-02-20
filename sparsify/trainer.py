@@ -120,12 +120,19 @@ class Trainer:
             )
             # For transcoders, also resolve output dimensions
             if cfg.sae.transcode:
-                output_widths = resolve_widths(
-                    model,
-                    cfg.hookpoints,
-                    mesh=self.mesh if DISTRIBUTE_MODEL else None,
-                    use_input_dim=False,
-                )
+                if cfg.sae.d_out > 0:
+                    # Use explicitly configured d_out for all hookpoints.
+                    # This is needed for MoE gates where resolve_widths picks up
+                    # the topk_indices dimension (e.g. 6) instead of the full
+                    # expert distribution dimension (e.g. 64).
+                    output_widths = {hook: cfg.sae.d_out for hook in cfg.hookpoints}
+                else:
+                    output_widths = resolve_widths(
+                        model,
+                        cfg.hookpoints,
+                        mesh=self.mesh if DISTRIBUTE_MODEL else None,
+                        use_input_dim=False,
+                    )
             else:
                 output_widths = (
                     input_widths  # For autoencoders, input and output are the same
@@ -599,6 +606,31 @@ class Trainer:
             if isinstance(outputs, tuple):
                 outputs, *aux_out = outputs
 
+            # Handle MoE gates that return (topk_indices, topk_weights) instead
+            # of raw logits (e.g. DeepSeek-V2). Reconstruct the full sparse
+            # distribution over experts so the transcoder has a proper target.
+            # The gate already applies softmax internally, so skip post_softmax.
+            _skip_softmax = False
+            if outputs.dtype in (torch.long, torch.int, torch.int32, torch.int64) and aux_out:
+                topk_indices = outputs
+                topk_weights = aux_out[0].float()
+                num_experts = self.cfg.sae.d_out or (topk_indices.max().item() + 1)
+                if topk_indices.ndim >= 3:
+                    topk_indices = topk_indices.flatten(0, 1)
+                    topk_weights = topk_weights.flatten(0, 1)
+                full_dist = torch.zeros(
+                    topk_indices.shape[0], num_experts,
+                    dtype=topk_weights.dtype, device=topk_weights.device,
+                )
+                full_dist.scatter_(1, topk_indices, topk_weights)
+                outputs = full_dist
+                aux_out = None
+                _skip_softmax = True
+
+            if loss_fn == "fvu":
+                inputs = inputs.detach()
+                outputs = outputs.detach()
+
             module_name = module_to_name[module]
             if module_name in cached_outputs:
                 outputs = cached_outputs.pop(module_name)
@@ -626,7 +658,7 @@ class Trainer:
                 inputs = outputs
 
             # Apply softmax BEFORE DTensor redistribution (softmax needs full feature dim)
-            if self.cfg.post_softmax and self.cfg.sae.transcode:
+            if self.cfg.post_softmax and self.cfg.sae.transcode and not _skip_softmax:
                 if isinstance(outputs, DTensor):
                     outputs = outputs.redistribute(
                         self.mesh, [Replicate(), Replicate()]
@@ -963,10 +995,12 @@ class Trainer:
                     out.unexplained_variance
                     + self.cfg.dead_latent_penalty * dead_latent_loss
                 ) / acc_steps
+                del out
 
                 # Do a "local" backward pass if we're not training end-to-end
                 loss.backward()
             del loss
+            torch.cuda.empty_cache()
 
             runner.restore()
 
@@ -1079,6 +1113,7 @@ class Trainer:
                                 .float()
                                 .mean()
                             )
+                            del clean_probs, clean_log_probs, dirty_lps
                             loss = kl
                             if self.cfg.loss_fn == "kl-fvu":
                                 if not isinstance(kl, DTensor):
@@ -1099,7 +1134,8 @@ class Trainer:
                             avg_losses = avg_kl
                             fvu_losses.clear()
                         case "fvu":
-                            self.model(x)
+                            with torch.no_grad():
+                                self.model(x)
                             avg_losses = dict(avg_unexplained_variance)
                         case other:
                             raise ValueError(f"Unknown loss function '{other}'")
@@ -1122,6 +1158,9 @@ class Trainer:
 
                 for scheduler in self.lr_schedulers:
                     scheduler.step()
+
+                # Reclaim fragmented GPU memory after the optimizer step
+                torch.cuda.empty_cache()
 
                 self.set_correct_k()
 
@@ -1516,6 +1555,9 @@ class Trainer:
 
                 for scheduler in self.lr_schedulers:
                     scheduler.step()
+
+                # Reclaim fragmented GPU memory after the optimizer step
+                torch.cuda.empty_cache()
 
                 self.set_correct_k()
 
