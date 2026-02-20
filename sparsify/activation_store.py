@@ -68,7 +68,10 @@ def cache_activations(
     os.makedirs(save_dir, exist_ok=True)
 
     # First pass: count total tokens
-    dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dl = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False,
+        pin_memory=True, num_workers=4, prefetch_factor=2,
+    )
     total_tokens = len(dataset) * ctx_len
 
     # Resolve dimensions with a dummy forward pass
@@ -91,7 +94,7 @@ def cache_activations(
         mod.register_forward_hook(partial(probe_hook, name=name))
         for name, mod in name_to_module.items()
     ]
-    with torch.no_grad():
+    with torch.inference_mode():
         model(x)
     for h in handles:
         h.remove()
@@ -134,7 +137,7 @@ def cache_activations(
 
     pbar = tqdm(dl, desc="Caching activations")
     for batch in pbar:
-        x = batch["input_ids"].to(device)
+        x = batch["input_ids"].to(device, non_blocking=True)
         B, S = x.shape
 
         # Compute bos_mask
@@ -151,7 +154,7 @@ def cache_activations(
             mod.register_forward_hook(partial(cache_hook, name=name))
             for name, mod in name_to_module.items()
         ]
-        with torch.no_grad():
+        with torch.inference_mode():
             model(x)
         for h in handles:
             h.remove()
@@ -273,12 +276,14 @@ class CachedActivationDataset(TorchDataset):
         inputs = {}
         outputs = {}
         for name in self.hookpoints:
+            # Data is already float16 on disk; .copy() is needed for memmap
+            # but .half() is redundant. Use torch.from_numpy directly.
             inputs[name] = torch.from_numpy(
                 self.memmaps[name]["inputs"][start:end].copy()
-            ).half()
+            )
             outputs[name] = torch.from_numpy(
                 self.memmaps[name]["outputs"][start:end].copy()
-            ).half()
+            )
 
         bos_mask = torch.from_numpy(
             self.memmaps[self.hookpoints[0]]["bos_mask"][start:end].copy()

@@ -28,6 +28,12 @@ from .utils import decoder_impl
 
 NO_COMPILE = os.environ.get("SPARSIFY_NO_COMPILE", "0") == "1"
 NO_RTOPK = os.environ.get("SPARSIFY_NO_RTOPK", "1") == "1"
+
+
+@torch.compiler.disable
+def _redistribute(tensor, mesh, placements):
+    """Wrap DTensor.redistribute so torch.compile/dynamo doesn't trace into it."""
+    return tensor.redistribute(mesh, placements)
 # Environment variable override for tile size (0=auto, -1=disabled, >0=explicit)
 ENV_TILE_SIZE = int(os.environ.get("SPARSIFY_TILE_SIZE", "0"))
 
@@ -173,6 +179,7 @@ def _tiled_topk_triton(
         K=k_po2,
         TILE_L=tile_l_po2,
         BLOCK_D=block_d_po2,
+        num_warps=4,
     )
 
     # Trim padding if k was rounded up
@@ -204,6 +211,10 @@ def _tiled_topk_pytorch(
     global_vals = x.new_full((N, k), float("-inf"))
     global_idxs = torch.zeros(N, k, device=x.device, dtype=torch.long)
 
+    # Pre-allocate merge buffer to avoid repeated allocations
+    merged_vals = torch.empty(N, 2 * k, device=x.device, dtype=x.dtype)
+    merged_idxs = torch.empty(N, 2 * k, device=x.device, dtype=torch.long)
+
     for start in range(0, num_latents, tile_size):
         end = min(start + tile_size, num_latents)
 
@@ -217,13 +228,16 @@ def _tiled_topk_pytorch(
 
         del tile_preacts  # free HBM immediately
 
-        # Merge with running global top-k
-        merged_vals = torch.cat([global_vals, tile_vals], dim=-1)
-        merged_idxs = torch.cat([global_idxs, tile_idxs], dim=-1)
+        # Merge with running global top-k using pre-allocated buffers
+        local_k = tile_vals.shape[1]
+        merged_vals[:, :k] = global_vals
+        merged_vals[:, k:k + local_k] = tile_vals
+        merged_idxs[:, :k] = global_idxs
+        merged_idxs[:, k:k + local_k] = tile_idxs
 
-        best = torch.topk(merged_vals, k, dim=-1, sorted=False)
+        best = torch.topk(merged_vals[:, :k + local_k], k, dim=-1, sorted=False)
         global_vals = best.values
-        global_idxs = merged_idxs.gather(-1, best.indices)
+        global_idxs = merged_idxs[:, :k + local_k].gather(-1, best.indices)
 
     return global_vals, global_idxs
 
@@ -307,7 +321,7 @@ class FusedEncoder(torch.autograd.Function):
         ctx.activation = activation
         return values
 
-    # @torch.compile
+    @torch.compile(disable=NO_COMPILE)
     @staticmethod
     @torch.no_grad()
     def backward(ctx, grad_values):
@@ -337,12 +351,12 @@ class FusedEncoder(torch.autograd.Function):
                 mesh = bias.device_mesh
                 grad_bias = torch.zeros_like(bias.to_local())
                 all_indices = indices.flatten()
-                all_indices = all_indices.redistribute(
-                    mesh, (dtensor.Replicate(), dtensor.Replicate())
+                all_indices = _redistribute(
+                    all_indices, mesh, (dtensor.Replicate(), dtensor.Replicate())
                 ).to_local()
                 all_values = grad_values.flatten()
-                all_values = all_values.redistribute(
-                    mesh, (dtensor.Replicate(), dtensor.Replicate())
+                all_values = _redistribute(
+                    all_values, mesh, (dtensor.Replicate(), dtensor.Replicate())
                 ).to_local()
 
                 # TODO bespoke all-to-all gradient communication
@@ -377,25 +391,25 @@ class FusedEncoder(torch.autograd.Function):
             else:
                 mesh = grad_values.device_mesh
                 local_weight = weight.to_local()
-                gathered_input = input.redistribute(
-                    mesh, (dtensor.Replicate(), dtensor.Replicate())
+                gathered_input = _redistribute(
+                    input, mesh, (dtensor.Replicate(), dtensor.Replicate())
                 ).to_local()
                 if activation == "groupmax":
-                    indices = indices.redistribute(
-                        mesh, (dtensor.Replicate(), dtensor.Shard(1))
+                    indices = _redistribute(
+                        indices, mesh, (dtensor.Replicate(), dtensor.Shard(1))
                     ).to_local()
-                    values = grad_values.redistribute(
-                        mesh, (dtensor.Replicate(), dtensor.Shard(1))
+                    values = _redistribute(
+                        grad_values, mesh, (dtensor.Replicate(), dtensor.Shard(1))
                     ).to_local()
                     local_k = ctx.k // mesh.shape[1]
                     start_f = mesh.get_local_rank(1) * local_k
                     indices = indices - start_f
                 else:
-                    gathered_indices = indices.redistribute(
-                        mesh, (dtensor.Replicate(), dtensor.Replicate())
+                    gathered_indices = _redistribute(
+                        indices, mesh, (dtensor.Replicate(), dtensor.Replicate())
                     ).to_local()
-                    gathered_values = grad_values.redistribute(
-                        mesh, (dtensor.Replicate(), dtensor.Replicate())
+                    gathered_values = _redistribute(
+                        grad_values, mesh, (dtensor.Replicate(), dtensor.Replicate())
                     ).to_local()
 
                     indices = gathered_indices.view(-1, ctx.k)

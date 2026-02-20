@@ -84,7 +84,7 @@ def embedding_bag_triton(
         bag_size=indices.shape[1],
         N=weight.shape[0],
         L=indices.shape[0],
-        num_warps=1,
+        num_warps=4,
         num_stages=1,
     )
     return trt_out
@@ -191,7 +191,7 @@ def embedding_bag_bw_rev_indices(
     assert gradient.shape == (B, dim)
     assert gradient.is_contiguous()
     count_per_emb = torch.zeros((K + 1,), dtype=torch.uint32, device=indices.device)
-    count_per_embedding_k[(B,)](count_per_emb, indices, bag_size=bag_size, num_warps=1)
+    count_per_embedding_k[(B,)](count_per_emb, indices, bag_size=bag_size, num_warps=4)
     emb_argsorted = count_per_emb[1:].int().argsort(descending=True)
     emb_begin_pos = count_per_emb.cumsum(0)
     reverse_mapping = torch.empty(
@@ -203,7 +203,7 @@ def embedding_bag_bw_rev_indices(
         mapping_write_pos_ptr=emb_begin_pos.clone(),
         indices_ptr=indices,
         bag_size=bag_size,
-        num_warps=1,
+        num_warps=4,
     )
     if weight_grad is None:
         weight_grad = torch.empty_like(weight)
@@ -226,7 +226,7 @@ def embedding_bag_bw_rev_indices(
         B=B,
         K=K,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=1,
+        num_warps=4,
     )
     return weight_grad, per_sample_weights_grad
 

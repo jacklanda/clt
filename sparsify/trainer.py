@@ -46,6 +46,56 @@ from .utils import (
 ScheduleFreeWrapperType = (ScheduleFreeWrapper, ScheduleFreeWrapperReference)
 
 
+class CUDAPrefetcher:
+    """Prefetch batches to GPU using a separate CUDA stream.
+
+    Overlaps CPU→GPU data transfer with GPU compute so the next batch
+    is ready by the time the current training step finishes.
+    """
+
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+
+    def _to_device(self, obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.to(self.device, non_blocking=True)
+        elif isinstance(obj, dict):
+            return {k: self._to_device(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return type(obj)(self._to_device(v) for v in obj)
+        return obj
+
+    def __iter__(self):
+        it = iter(self.loader)
+        try:
+            first = next(it)
+        except StopIteration:
+            return
+
+        with torch.cuda.stream(self.stream):
+            first = self._to_device(first)
+
+        for next_batch in it:
+            # Wait for the prefetched batch to finish transferring
+            torch.cuda.current_stream(self.device).wait_stream(self.stream)
+            batch = first
+
+            # Start prefetching the next batch
+            with torch.cuda.stream(self.stream):
+                first = self._to_device(next_batch)
+
+            yield batch
+
+        # Yield the last prefetched batch
+        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        yield first
+
+    def __len__(self):
+        return len(self.loader)
+
+
 class WarmupLinearSchedule(torch.optim.lr_scheduler.LambdaLR):
     def __init__(self, optimizer, warmup_steps, num_training_steps):
         self.warmup_steps = warmup_steps
@@ -501,6 +551,10 @@ class Trainer:
             # NOTE: We do not shuffle here for reproducibility; the dataset should
             # be shuffled before passing it to the trainer.
             shuffle=False,
+            pin_memory=True,
+            num_workers=4,
+            prefetch_factor=2,
+            persistent_workers=True,
         )
         pbar = tqdm(
             desc="Training",
@@ -939,35 +993,53 @@ class Trainer:
                 )
 
                 # Only accumulate expensive metrics when they were computed
+                # Batch all float() calls into a single tensor to reduce CUDA syncs
                 if _compute_metrics[0]:
                     metrics_denom = acc_steps  # only computed on last log window step
-                    avg_explained_variance[name] += float(
-                        out.explained_variance.detach() / metrics_denom
-                    )
-                    avg_explained_variance_legacy[name] += float(
-                        out.explained_variance_legacy.detach() / metrics_denom
-                    )
-                    avg_unexplained_variance_legacy[name] += float(
-                        out.unexplained_variance_legacy.detach() / metrics_denom
-                    )
-                    avg_per_token_l0[name] += float(out.per_token_l0 / metrics_denom)
-                    avg_per_sequence_l0[name] += float(out.per_sequence_l0 / metrics_denom)
-                    avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / metrics_denom)
-                    avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / metrics_denom)
-                    avg_per_token_l1[name] += float(out.per_token_l1 / metrics_denom)
-                    avg_per_sequence_l1[name] += float(out.per_sequence_l1 / metrics_denom)
-                    avg_per_batch_l1[name] += float(out.per_batch_l1.sum() / metrics_denom)
-                    avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / metrics_denom)
-                    avg_mse_loss[name] += float(out.mse_loss / metrics_denom)
-                    avg_norm_mse_loss[name] += float(out.norm_mse_loss / metrics_denom)
-                    avg_l2_loss[name] += float(out.l2_loss / metrics_denom)
-                    avg_l2_ratio[name] += float(out.l2_ratio / metrics_denom)
-                    avg_cossim[name] += float(out.cossim / metrics_denom)
-                    avg_relative_reconstruction_bias[name] += float(
-                        out.relative_reconstruction_bias / metrics_denom
-                    )
-                    avg_frac_alive[name] += float(out.frac_alive / metrics_denom)
-                    avg_frac_dead[name] += float(out.frac_dead / metrics_denom)
+                    _metrics = torch.stack([
+                        out.explained_variance.detach(),
+                        out.explained_variance_legacy.detach(),
+                        out.unexplained_variance_legacy.detach(),
+                        torch.as_tensor(out.per_token_l0, device=device),
+                        torch.as_tensor(out.per_sequence_l0, device=device),
+                        out.per_batch_l0.sum() if isinstance(out.per_batch_l0, Tensor) else torch.as_tensor(out.per_batch_l0, device=device),
+                        out.per_feature_l0.mean() if isinstance(out.per_feature_l0, Tensor) else torch.as_tensor(out.per_feature_l0, device=device),
+                        torch.as_tensor(out.per_token_l1, device=device),
+                        torch.as_tensor(out.per_sequence_l1, device=device),
+                        out.per_batch_l1.sum() if isinstance(out.per_batch_l1, Tensor) else torch.as_tensor(out.per_batch_l1, device=device),
+                        out.per_feature_l1.mean() if isinstance(out.per_feature_l1, Tensor) else torch.as_tensor(out.per_feature_l1, device=device),
+                        torch.as_tensor(out.mse_loss, device=device),
+                        torch.as_tensor(out.norm_mse_loss, device=device),
+                        torch.as_tensor(out.l2_loss, device=device),
+                        torch.as_tensor(out.l2_ratio, device=device),
+                        torch.as_tensor(out.cossim, device=device),
+                        torch.as_tensor(out.relative_reconstruction_bias, device=device),
+                        torch.as_tensor(out.frac_alive, device=device),
+                        torch.as_tensor(out.frac_dead, device=device),
+                    ]).float()
+                    if isinstance(_metrics, DTensor):
+                        _metrics = _metrics.to_local()
+                    _metrics = _metrics.cpu()  # single CUDA sync
+                    _m = _metrics / metrics_denom
+                    avg_explained_variance[name] += _m[0].item()
+                    avg_explained_variance_legacy[name] += _m[1].item()
+                    avg_unexplained_variance_legacy[name] += _m[2].item()
+                    avg_per_token_l0[name] += _m[3].item()
+                    avg_per_sequence_l0[name] += _m[4].item()
+                    avg_per_batch_l0[name] += _m[5].item()
+                    avg_per_feature_l0[name] += _m[6].item()
+                    avg_per_token_l1[name] += _m[7].item()
+                    avg_per_sequence_l1[name] += _m[8].item()
+                    avg_per_batch_l1[name] += _m[9].item()
+                    avg_per_feature_l1[name] += _m[10].item()
+                    avg_mse_loss[name] += _m[11].item()
+                    avg_norm_mse_loss[name] += _m[12].item()
+                    avg_l2_loss[name] += _m[13].item()
+                    avg_l2_ratio[name] += _m[14].item()
+                    avg_cossim[name] += _m[15].item()
+                    avg_relative_reconstruction_bias[name] += _m[16].item()
+                    avg_frac_alive[name] += _m[17].item()
+                    avg_frac_dead[name] += _m[18].item()
 
                 prev_modules = [mod for mod in runner.outputs.keys() if mod != name]
                 prev_modules = [self.saes[mod] for mod in prev_modules]
@@ -1000,7 +1072,6 @@ class Trainer:
                 # Do a "local" backward pass if we're not training end-to-end
                 loss.backward()
             del loss
-            torch.cuda.empty_cache()
 
             runner.restore()
 
@@ -1154,13 +1225,10 @@ class Trainer:
 
                 for name, optimizer in zip(self.saes.keys(), self.optimizers):
                     optimizer.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
 
                 for scheduler in self.lr_schedulers:
                     scheduler.step()
-
-                # Reclaim fragmented GPU memory after the optimizer step
-                torch.cuda.empty_cache()
 
                 self.set_correct_k()
 
@@ -1368,6 +1436,7 @@ class Trainer:
             pin_memory=True,
             num_workers=4,
             prefetch_factor=2,
+            persistent_workers=True,
         )
 
         # GradScaler for float16 stability
@@ -1423,10 +1492,14 @@ class Trainer:
         runner = CrossLayerRunner()
         first_batch = True
 
-        for batch in dl:
-            # batch["inputs"] and batch["outputs"] are dicts: hookpoint -> [B, ctx_len, d]
-            # batch["bos_mask"] is [B, ctx_len]
-            bos_mask = batch["bos_mask"].to(device)
+        # Use CUDA prefetcher to overlap data transfer with compute
+        prefetcher = CUDAPrefetcher(dl, device)
+
+        for batch in prefetcher:
+            # batch[\"inputs\"] and batch[\"outputs\"] are dicts: hookpoint -> [B, ctx_len, d]
+            # batch[\"bos_mask\"] is [B, ctx_len]
+            # Data is already on GPU from the prefetcher
+            bos_mask = batch["bos_mask"]
             bos_mask_flat = bos_mask.flatten(0, 1)
 
             runner.reset()
@@ -1441,9 +1514,18 @@ class Trainer:
             )
             _compute_metrics[0] = is_logging_step
 
+            # Pre-compute bos_mask DTensor redistribution once for all hookpoints
+            if self.mesh is not None:
+                bos_mask_mesh = DTensor.from_local(
+                    bos_mask_flat, self.mesh, [Replicate(), Replicate()]
+                ).redistribute(self.mesh, [Shard(0), Replicate()])
+            else:
+                bos_mask_mesh = bos_mask_flat
+
             for name in self.cfg.hookpoints:
-                inputs = batch["inputs"][name].to(device).flatten(0, 1)
-                outputs = batch["outputs"][name].to(device).flatten(0, 1)
+                # Data already on GPU from prefetcher
+                inputs = batch["inputs"][name].flatten(0, 1)
+                outputs = batch["outputs"][name].flatten(0, 1)
 
                 # Apply softmax BEFORE DTensor conversion (needs full feature dim)
                 if self.cfg.post_softmax and self.cfg.sae.transcode:
@@ -1456,11 +1538,6 @@ class Trainer:
                     outputs = DTensor.from_local(
                         outputs, self.mesh, [Replicate(), Replicate()]
                     ).redistribute(self.mesh, [Shard(0), Shard(1)])
-                    bos_mask_mesh = DTensor.from_local(
-                        bos_mask_flat, self.mesh, [Replicate(), Replicate()]
-                    ).redistribute(self.mesh, [Shard(0), Replicate()])
-                else:
-                    bos_mask_mesh = bos_mask_flat
 
                 raw = self.saes[name]
 
@@ -1501,33 +1578,53 @@ class Trainer:
                 )
 
                 # Only accumulate expensive metrics when computed
+                # Batch all float() calls into a single tensor to reduce CUDA syncs
                 if _compute_metrics[0]:
                     metrics_denom = acc_steps
-                    avg_explained_variance[name] += float(
-                        out.explained_variance.detach() / metrics_denom
-                    )
-                    avg_explained_variance_legacy[name] += float(
-                        out.explained_variance_legacy.detach() / metrics_denom
-                    )
-                    avg_unexplained_variance_legacy[name] += float(
-                        out.unexplained_variance_legacy.detach() / metrics_denom
-                    )
-                    avg_per_token_l0[name] += float(out.per_token_l0 / metrics_denom)
-                    avg_per_sequence_l0[name] += float(out.per_sequence_l0 / metrics_denom)
-                    avg_per_batch_l0[name] += float(out.per_batch_l0.sum() / metrics_denom)
-                    avg_per_feature_l0[name] += float(out.per_feature_l0.mean() / metrics_denom)
-                    avg_per_token_l1[name] += float(out.per_token_l1 / metrics_denom)
-                    avg_per_sequence_l1[name] += float(out.per_sequence_l1 / metrics_denom)
-                    avg_per_batch_l1[name] += float(out.per_batch_l1.sum() / metrics_denom)
-                    avg_per_feature_l1[name] += float(out.per_feature_l1.mean() / metrics_denom)
-                    avg_mse_loss[name] += float(out.mse_loss / metrics_denom)
-                    avg_norm_mse_loss[name] += float(out.norm_mse_loss / metrics_denom)
-                    avg_l2_loss[name] += float(out.l2_loss / metrics_denom)
-                    avg_l2_ratio[name] += float(out.l2_ratio / metrics_denom)
-                    avg_cossim[name] += float(out.cossim / metrics_denom)
-                    avg_relative_reconstruction_bias[name] += float(
-                        out.relative_reconstruction_bias / metrics_denom
-                    )
+                    _metrics = torch.stack([
+                        out.explained_variance.detach(),
+                        out.explained_variance_legacy.detach(),
+                        out.unexplained_variance_legacy.detach(),
+                        torch.as_tensor(out.per_token_l0, device=device),
+                        torch.as_tensor(out.per_sequence_l0, device=device),
+                        out.per_batch_l0.sum() if isinstance(out.per_batch_l0, Tensor) else torch.as_tensor(out.per_batch_l0, device=device),
+                        out.per_feature_l0.mean() if isinstance(out.per_feature_l0, Tensor) else torch.as_tensor(out.per_feature_l0, device=device),
+                        torch.as_tensor(out.per_token_l1, device=device),
+                        torch.as_tensor(out.per_sequence_l1, device=device),
+                        out.per_batch_l1.sum() if isinstance(out.per_batch_l1, Tensor) else torch.as_tensor(out.per_batch_l1, device=device),
+                        out.per_feature_l1.mean() if isinstance(out.per_feature_l1, Tensor) else torch.as_tensor(out.per_feature_l1, device=device),
+                        torch.as_tensor(out.mse_loss, device=device),
+                        torch.as_tensor(out.norm_mse_loss, device=device),
+                        torch.as_tensor(out.l2_loss, device=device),
+                        torch.as_tensor(out.l2_ratio, device=device),
+                        torch.as_tensor(out.cossim, device=device),
+                        torch.as_tensor(out.relative_reconstruction_bias, device=device),
+                        torch.as_tensor(out.frac_alive, device=device),
+                        torch.as_tensor(out.frac_dead, device=device),
+                    ]).float()
+                    if isinstance(_metrics, DTensor):
+                        _metrics = _metrics.to_local()
+                    _metrics = _metrics.cpu()  # single CUDA sync
+                    _m = _metrics / metrics_denom
+                    avg_explained_variance[name] += _m[0].item()
+                    avg_explained_variance_legacy[name] += _m[1].item()
+                    avg_unexplained_variance_legacy[name] += _m[2].item()
+                    avg_per_token_l0[name] += _m[3].item()
+                    avg_per_sequence_l0[name] += _m[4].item()
+                    avg_per_batch_l0[name] += _m[5].item()
+                    avg_per_feature_l0[name] += _m[6].item()
+                    avg_per_token_l1[name] += _m[7].item()
+                    avg_per_sequence_l1[name] += _m[8].item()
+                    avg_per_batch_l1[name] += _m[9].item()
+                    avg_per_feature_l1[name] += _m[10].item()
+                    avg_mse_loss[name] += _m[11].item()
+                    avg_norm_mse_loss[name] += _m[12].item()
+                    avg_l2_loss[name] += _m[13].item()
+                    avg_l2_ratio[name] += _m[14].item()
+                    avg_cossim[name] += _m[15].item()
+                    avg_relative_reconstruction_bias[name] += _m[16].item()
+                    avg_frac_alive[name] += _m[17].item()
+                    avg_frac_dead[name] += _m[18].item()
                     avg_frac_alive[name] += float(out.frac_alive / metrics_denom)
                     avg_frac_dead[name] += float(out.frac_dead / metrics_denom)
 
@@ -1550,14 +1647,11 @@ class Trainer:
 
                 for optimizer in self.optimizers:
                     scaler.step(optimizer)
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                 scaler.update()
 
                 for scheduler in self.lr_schedulers:
                     scheduler.step()
-
-                # Reclaim fragmented GPU memory after the optimizer step
-                torch.cuda.empty_cache()
 
                 self.set_correct_k()
 

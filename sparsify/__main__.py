@@ -29,6 +29,7 @@ from .trainer import TrainConfig, Trainer
 from .utils import DISTRIBUTE_MODEL
 
 torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
 
 # Suppress Pydantic warnings from simple_parsing's internal implementation
 warnings.filterwarnings(
@@ -151,9 +152,15 @@ def load_artifacts(
     # if not (torch.distributed.is_initialized() and DISTRIBUTE_MODEL):
     # model = torch.compile(model, mode="default", dynamic=True)
     # else:
-    # Force eager attention implementation to avoid DTensor issues
-    model.config._attn_implementation = "sdpa"
-    # model.config._attn_implementation = "flash_attention_2"
+    # Use flash_attention_2 when available for faster attention, fall back to sdpa
+    try:
+        from transformers.utils import is_flash_attn_2_available
+        if is_flash_attn_2_available():
+            model.config._attn_implementation = "flash_attention_2"
+        else:
+            model.config._attn_implementation = "sdpa"
+    except ImportError:
+        model.config._attn_implementation = "sdpa"
     model.config.use_cache = False
 
     # For memmap-style datasets
@@ -365,7 +372,14 @@ def _run_cached(args: RunConfig, rank: int, distributed: bool,
         dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else "auto",
         token=args.hf_token,
     )
-    model.config._attn_implementation = "sdpa"
+    try:
+        from transformers.utils import is_flash_attn_2_available
+        if is_flash_attn_2_available():
+            model.config._attn_implementation = "flash_attention_2"
+        else:
+            model.config._attn_implementation = "sdpa"
+    except ImportError:
+        model.config._attn_implementation = "sdpa"
     model.config.use_cache = False
 
     if distributed and DISTRIBUTE_MODEL:
