@@ -676,6 +676,8 @@ class Trainer:
                     topk_indices.shape[0], num_experts,
                     dtype=topk_weights.dtype, device=topk_weights.device,
                 )
+                # Clamp indices to valid range to prevent CUDA scatter OOB
+                topk_indices = topk_indices.clamp(0, num_experts - 1)
                 full_dist.scatter_(1, topk_indices, topk_weights)
                 outputs = full_dist
                 aux_out = None
@@ -966,6 +968,8 @@ class Trainer:
 
             if isinstance(latent_indices, DTensor):
                 latent_indices = latent_indices.to_local()
+            # Clamp indices to valid range to prevent CUDA index OOB
+            latent_indices = latent_indices.clamp(0, did_fire[name].shape[0] - 1)
             did_fire[name][latent_indices] = True
             self.maybe_all_reduce(did_fire[name], "max")
 
@@ -995,7 +999,9 @@ class Trainer:
                 # Only accumulate expensive metrics when they were computed
                 # Batch all float() calls into a single tensor to reduce CUDA syncs
                 if _compute_metrics[0]:
-                    metrics_denom = acc_steps  # only computed on last log window step
+                    # Metrics are only computed once per log window (on the
+                    # last sub-step before the logging boundary), so no
+                    # averaging across accumulation steps is needed.
                     _metrics = torch.stack([
                         out.explained_variance.detach(),
                         out.explained_variance_legacy.detach(),
@@ -1019,8 +1025,7 @@ class Trainer:
                     ]).float()
                     if isinstance(_metrics, DTensor):
                         _metrics = _metrics.to_local()
-                    _metrics = _metrics.cpu()  # single CUDA sync
-                    _m = _metrics / metrics_denom
+                    _m = _metrics.cpu()  # single CUDA sync
                     avg_explained_variance[name] += _m[0].item()
                     avg_explained_variance_legacy[name] += _m[1].item()
                     avg_unexplained_variance_legacy[name] += _m[2].item()
@@ -1053,9 +1058,20 @@ class Trainer:
                     dead_latent_loss = DeadLatentLoss.apply(
                         inputs, raw.encoder.weight, raw.encoder.bias, norms
                     )
+                    # Redistribute norms to Replicate so that global
+                    # latent indices (produced by fused_encoder) can safely
+                    # index into the full norms vector.
+                    if isinstance(norms, DTensor):
+                        norms_rep = norms.redistribute(
+                            norms.device_mesh,
+                            [Replicate()] * len(norms.placements),
+                        )
+                        norms_local = norms_rep.to_local()
+                    else:
+                        norms_local = norms
                     active_correction = (
                         encoding.latent_acts.to_local()
-                        * norms.to_local()[encoding.latent_indices.to_local()]
+                        * norms_local[encoding.latent_indices.to_local()]
                     ).sum()
                     if self.mesh is not None:
                         active_correction = DTensor.from_local(
@@ -1569,6 +1585,8 @@ class Trainer:
                 latent_indices = encoding.latent_indices.flatten()
                 if isinstance(latent_indices, DTensor):
                     latent_indices = latent_indices.to_local()
+                # Clamp indices to valid range to prevent CUDA index OOB
+                latent_indices = latent_indices.clamp(0, did_fire[name].shape[0] - 1)
                 did_fire[name][latent_indices] = True
                 self.maybe_all_reduce(did_fire[name], "max")
 
@@ -1580,7 +1598,9 @@ class Trainer:
                 # Only accumulate expensive metrics when computed
                 # Batch all float() calls into a single tensor to reduce CUDA syncs
                 if _compute_metrics[0]:
-                    metrics_denom = acc_steps
+                    # Metrics are only computed once per log window (on the
+                    # last sub-step before the logging boundary), so no
+                    # averaging across accumulation steps is needed.
                     _metrics = torch.stack([
                         out.explained_variance.detach(),
                         out.explained_variance_legacy.detach(),
@@ -1604,8 +1624,7 @@ class Trainer:
                     ]).float()
                     if isinstance(_metrics, DTensor):
                         _metrics = _metrics.to_local()
-                    _metrics = _metrics.cpu()  # single CUDA sync
-                    _m = _metrics / metrics_denom
+                    _m = _metrics.cpu()  # single CUDA sync
                     avg_explained_variance[name] += _m[0].item()
                     avg_explained_variance_legacy[name] += _m[1].item()
                     avg_unexplained_variance_legacy[name] += _m[2].item()

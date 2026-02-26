@@ -259,7 +259,7 @@ def _resolve_tile_size(num_latents: int, k: int, cfg_tile_size: int) -> int:
     return max(4096, 4 * k)
 
 
-@torch.compile
+@torch.compile(disable=NO_COMPILE)
 def rtopk_topk(data, k: int, max_iter=10, k_div: int = 1):
     if rtopk is None or NO_RTOPK:
         return torch.topk(data, k, dim=1, sorted=False)
@@ -321,7 +321,10 @@ class FusedEncoder(torch.autograd.Function):
         ctx.activation = activation
         return values
 
-    @torch.compile(disable=NO_COMPILE)
+    # NOTE: torch.compile is intentionally disabled on the backward pass.
+    # Compiling the backward with DTensor operations (isinstance checks,
+    # redistribute, to_local, index_add_) causes intermittent CUDA
+    # "index out of bounds" assertions in ScatterGatherKernel.cu.
     @staticmethod
     @torch.no_grad()
     def backward(ctx, grad_values):
@@ -333,8 +336,10 @@ class FusedEncoder(torch.autograd.Function):
 
         # --- Grad w.r.t. input ---
         if ctx.needs_input_grad[0]:
+            # Clamp indices to valid range to prevent CUDA scatter/gather OOB
+            clamped_indices = indices.clamp(0, weight.shape[0] - 1)
             grad_input = decoder_impl(
-                indices,
+                clamped_indices,
                 grad_values,
                 weight,
             )
@@ -365,6 +370,8 @@ class FusedEncoder(torch.autograd.Function):
                 all_indices = all_indices[mask] - start_feature
                 all_values = all_values[mask]
 
+                # Clamp indices to valid range to prevent CUDA scatter OOB
+                all_indices = all_indices.clamp(0, grad_bias.shape[0] - 1)
                 grad_bias.index_add_(
                     0, all_indices, all_values.type_as(bias.to_local())
                 )
@@ -373,8 +380,9 @@ class FusedEncoder(torch.autograd.Function):
                 )
             else:
                 grad_bias = torch.zeros_like(bias)
+                flat_indices = indices.flatten().clamp(0, grad_bias.shape[0] - 1)
                 grad_bias.index_add_(
-                    0, indices.flatten(), grad_values.flatten().type_as(bias)
+                    0, flat_indices, grad_values.flatten().type_as(bias)
                 )
 
         # --- Grad w.r.t. weight ---
@@ -671,7 +679,9 @@ def fused_encoder(
                 ).redistribute(mesh, (dtensor.Shard(0), dtensor.Replicate()))
                 local_values, local_indices = values.to_local(), indices.to_local()
                 local_values, local_indices_ = rtopk_topk(local_values, k=k)
-                local_indices = torch.gather(local_indices, 1, local_indices_.long())
+                # Clamp gather indices to prevent CUDA OOB from compiled rtopk_topk
+                local_indices_ = local_indices_.long().clamp(0, local_indices.shape[1] - 1)
+                local_indices = torch.gather(local_indices, 1, local_indices_)
                 values = dtensor.DTensor.from_local(
                     local_values,
                     mesh,

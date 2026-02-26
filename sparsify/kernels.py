@@ -77,8 +77,10 @@ def triton_coo_sparse_dense_matmul(
     assert coo_values.is_contiguous()
     assert coo_indices.is_contiguous()
 
+    original_dtype = coo_values.dtype
     if out is None:
-        out = torch.zeros(N, B, device=dense.device, dtype=coo_values.dtype)
+        # Use float32 for the output buffer because triton atomic_add does not support bf16
+        out = torch.zeros(N, B, device=dense.device, dtype=torch.float32)
 
     def grid(META):
         return triton.cdiv(AK, META["BLOCK_SIZE_AK"]), triton.cdiv(
@@ -100,7 +102,7 @@ def triton_coo_sparse_dense_matmul(
         BLOCK_SIZE_B=BLOCK_SIZE_B,
         # flip_indices=flip_indices,
     )
-    return out
+    return out.to(original_dtype)
 
 
 @triton.jit

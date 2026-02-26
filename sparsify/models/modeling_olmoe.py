@@ -604,19 +604,31 @@ class OlmoeSparseMoeBlock(nn.Module):
 
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be selected
+
+        # Clamp expert indices to valid range to prevent CUDA OOB in one_hot
+        selected_experts = selected_experts.clamp(0, self.num_experts - 1)
+
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # Convert DTensors to regular tensors before the expert loop.
+        # Use full_tensor() (not to_local()) to get the complete unsharded tensor.
+        def _to_regular(t):
+            if isinstance(t, torch.Tensor) and hasattr(t, 'full_tensor'):
+                return t.full_tensor()
+            return t
+
+        expert_mask = _to_regular(expert_mask)
+        hidden_states = _to_regular(hidden_states)
+        routing_weights = _to_regular(routing_weights)
+        final_hidden_states = _to_regular(final_hidden_states)
 
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
-            # idx, top_x = torch.where(expert_mask[expert_idx])
-            # Solution: Convert to local tensor, compute indices, then handle appropriately
-            # Convert to local once before the loop
-            if hasattr(expert_mask, 'to_local'):
-                expert_mask = expert_mask.to_local()
-            elif hasattr(expert_mask, 'full_tensor'):
-                expert_mask = expert_mask.full_tensor()
             idx, top_x = torch.where(expert_mask[expert_idx])
+
+            if top_x.numel() == 0:
+                continue
 
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
@@ -626,20 +638,7 @@ class OlmoeSparseMoeBlock(nn.Module):
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
-            # final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-            # Replace index_add_ with operations that have DTensor support
-            current_hidden = current_hidden_states.to(hidden_states.dtype)
-
-            num_tokens = final_hidden_states.size(0)
-            indices_one_hot = torch.zeros(
-                len(top_x), num_tokens,
-                device=final_hidden_states.device,
-                dtype=final_hidden_states.dtype
-            )
-            indices_one_hot[torch.arange(len(top_x)), top_x] = 1
-
-            accumulated = torch.matmul(indices_one_hot.T, current_hidden)
-            final_hidden_states = final_hidden_states + accumulated
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 

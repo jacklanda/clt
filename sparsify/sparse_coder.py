@@ -244,6 +244,8 @@ class MidDecoder:
             latent_acts = latent_acts.to_local()
             latent_indices = self.latent_indices.to_local()
             post_enc = post_enc.to_local()
+            # Clamp indices to valid range to prevent CUDA scatter/gather OOB
+            latent_indices = latent_indices.clamp(0, post_enc.shape[0] - 1)
             latent_acts = latent_acts + post_enc[latent_indices] * (latent_acts > 0)
             if post_enc_scale is not None:
                 latent_acts = latent_acts * post_enc_scale[latent_indices]
@@ -253,11 +255,13 @@ class MidDecoder:
                 placements=self.latent_acts.placements,
             )
         else:
-            latent_acts = latent_acts + post_enc[self.latent_indices] * (
+            # Clamp indices to valid range to prevent CUDA scatter/gather OOB
+            latent_indices = self.latent_indices.clamp(0, post_enc.shape[0] - 1)
+            latent_acts = latent_acts + post_enc[latent_indices] * (
                 latent_acts > 0
             )
             if post_enc_scale is not None:
-                latent_acts = latent_acts * post_enc_scale[self.latent_indices]
+                latent_acts = latent_acts * post_enc_scale[latent_indices]
 
         return latent_acts
 
@@ -663,26 +667,43 @@ class SparseCoder(nn.Module):
             )
 
         if decoder:
-            # Transcoder initialization: use zeros
+            # Transcoder initialization: use random init for W_dec
             if cfg.transcode:
 
                 def create_W_dec():
                     num_latents = self.num_latents
                     if self.cfg.coalesce_topk == "per-layer":
                         num_latents *= max(1, cfg.n_sources)
+                    # Use random init (uniform [-1/sqrt(d_out), 1/sqrt(d_out)])
+                    # instead of zeros to avoid dead gradients when paired with
+                    # zero-initialized post_enc_scale in multi-target mode.
+                    scaling = 1 / self.d_out**0.5
                     if mesh is not None:
-                        result = dtensor.zeros(
-                            (num_latents, self.d_out),
-                            dtype=decoder_dtype,
-                            device_mesh=mesh,
-                            placements=[
-                                dtensor.Replicate(),
-                                dtensor.Shard(1) if cfg.tp_output else dtensor.Shard(0),
-                            ],
+                        result = (
+                            dtensor.rand(
+                                (num_latents, self.d_out),
+                                dtype=decoder_dtype,
+                                device_mesh=mesh,
+                                placements=[
+                                    dtensor.Replicate(),
+                                    dtensor.Shard(1)
+                                    if cfg.tp_output
+                                    else dtensor.Shard(0),
+                                ],
+                            )
+                            * (2.0 * scaling)
+                            - scaling
                         )
                     else:
-                        result = torch.zeros(
-                            num_latents, self.d_out, device=device, dtype=decoder_dtype
+                        result = (
+                            torch.rand(
+                                num_latents,
+                                self.d_out,
+                                device=device,
+                                dtype=decoder_dtype,
+                            )
+                            * (2.0 * scaling)
+                            - scaling
                         )
                     return nn.Parameter(result)
 
@@ -1031,6 +1052,8 @@ class SparseCoder(nn.Module):
 
         assert W_dec is not None, "Decoder weight was not initialized."
 
+        # Clamp indices to valid range to prevent CUDA scatter/gather OOB
+        top_indices = top_indices.clamp(0, W_dec.shape[0] - 1)
         y = decoder_impl(top_indices, top_acts.to(self.dtype), W_dec)
         return y + b_dec
 
