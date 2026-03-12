@@ -221,11 +221,14 @@ class MidDecoder:
 
     @property
     def current_latent_acts(self):
-        post_enc = (
-            self.sparse_coder.post_encs[self.index]
-            if self.sparse_coder.multi_target
-            else self.sparse_coder.post_enc
-        )
+        has_post_enc_bias = self.sparse_coder.cfg.post_enc_bias
+
+        if has_post_enc_bias:
+            post_enc = (
+                self.sparse_coder.post_encs[self.index]
+                if self.sparse_coder.multi_target
+                else self.sparse_coder.post_enc
+            )
 
         if self.sparse_coder.cfg.post_encoder_scale:
             post_enc_scale = (
@@ -243,11 +246,14 @@ class MidDecoder:
         if isinstance(latent_acts, dtensor.DTensor):
             latent_acts = latent_acts.to_local()
             latent_indices = self.latent_indices.to_local()
-            post_enc = post_enc.to_local()
-            # Clamp indices to valid range to prevent CUDA scatter/gather OOB
-            latent_indices = latent_indices.clamp(0, post_enc.shape[0] - 1)
-            latent_acts = latent_acts + post_enc[latent_indices] * (latent_acts > 0)
+            if has_post_enc_bias:
+                post_enc = post_enc.to_local()
+                # Clamp indices to valid range to prevent CUDA scatter/gather OOB
+                latent_indices = latent_indices.clamp(0, post_enc.shape[0] - 1)
+                latent_acts = latent_acts + post_enc[latent_indices] * (latent_acts > 0)
             if post_enc_scale is not None:
+                if not has_post_enc_bias:
+                    latent_indices = latent_indices.clamp(0, post_enc_scale.shape[0] - 1)
                 latent_acts = latent_acts * post_enc_scale[latent_indices]
             latent_acts = dtensor.DTensor.from_local(
                 latent_acts,
@@ -255,12 +261,17 @@ class MidDecoder:
                 placements=self.latent_acts.placements,
             )
         else:
-            # Clamp indices to valid range to prevent CUDA scatter/gather OOB
-            latent_indices = self.latent_indices.clamp(0, post_enc.shape[0] - 1)
-            latent_acts = latent_acts + post_enc[latent_indices] * (
-                latent_acts > 0
-            )
+            if has_post_enc_bias:
+                # Clamp indices to valid range to prevent CUDA scatter/gather OOB
+                latent_indices = self.latent_indices.clamp(0, post_enc.shape[0] - 1)
+                latent_acts = latent_acts + post_enc[latent_indices] * (
+                    latent_acts > 0
+                )
             if post_enc_scale is not None:
+                if not has_post_enc_bias:
+                    latent_indices = self.latent_indices.clamp(0, post_enc_scale.shape[0] - 1)
+                else:
+                    latent_indices = latent_indices  # already clamped above
                 latent_acts = latent_acts * post_enc_scale[latent_indices]
 
         return latent_acts
@@ -815,12 +826,13 @@ class SparseCoder(nn.Module):
             post_enc = nn.Parameter(post_enc, requires_grad=cfg.train_post_encoder)
             return post_enc
 
-        if self.multi_target:
-            self.post_encs = nn.ParameterList()
-            for _ in range(cfg.n_targets):
-                self.post_encs.append(make_post_enc())
-        else:
-            self.post_enc = make_post_enc()
+        if cfg.post_enc_bias:
+            if self.multi_target:
+                self.post_encs = nn.ParameterList()
+                for _ in range(cfg.n_targets):
+                    self.post_encs.append(make_post_enc())
+            else:
+                self.post_enc = make_post_enc()
 
         if self.cfg.post_encoder_scale:
             if self.multi_target:
