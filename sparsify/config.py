@@ -68,6 +68,10 @@ class SparseCoderConfig(Serializable):
     train_post_encoder: bool = True
     """Train the post-encoder bias."""
 
+    post_enc_bias: bool = True
+    """Create additive post-encoder biases (post_encs). When False, only
+    post_enc_scales are used (if post_encoder_scale=True)."""
+
     post_encoder_scale: bool = False
     """Train a scale for post-encoder layers."""
 
